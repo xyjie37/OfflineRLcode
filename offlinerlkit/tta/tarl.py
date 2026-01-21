@@ -131,27 +131,29 @@ class TARLManager:
         if not hasattr(self.policy, 'actor'):
             raise ValueError("Policy must have an actor module for TARL")
 
-        action_dist = self.policy.actor(obs)
+        self.policy.eval()
+        with torch.no_grad():
+            action_dist = self.policy.actor(obs)
 
-        if hasattr(action_dist, 'mean'):
-            mu = action_dist.mean
-        elif hasattr(action_dist, 'mode'):
-            mu = action_dist.mode()[0]
-        else:
-            mu = action_dist
-
-        if hasattr(action_dist, 'stddev'):
-            sigma = action_dist.stddev
-        elif hasattr(action_dist, 'scale'):
-            sigma = action_dist.scale
-        else:
-            if hasattr(action_dist, 'log_std'):
-                log_std = action_dist.log_std
-                if isinstance(log_std, tuple):
-                    log_std = torch.cat([ls.unsqueeze(0) for ls in log_std], dim=-1)
-                sigma = F.softplus(log_std) + 1e-6
+            if hasattr(action_dist, 'mean'):
+                mu = action_dist.mean.detach().clone()
+            elif hasattr(action_dist, 'mode'):
+                mu = action_dist.mode()[0].detach().clone()
             else:
-                sigma = torch.ones_like(mu)
+                mu = action_dist.detach().clone()
+
+            if hasattr(action_dist, 'stddev'):
+                sigma = action_dist.stddev.detach().clone()
+            elif hasattr(action_dist, 'scale'):
+                sigma = action_dist.scale.detach().clone()
+            else:
+                if hasattr(action_dist, 'log_std'):
+                    log_std = action_dist.log_std
+                    if isinstance(log_std, tuple):
+                        log_std = torch.cat([ls.unsqueeze(0) for ls in log_std], dim=-1)
+                    sigma = F.softplus(log_std).detach().clone() + 1e-6
+                else:
+                    sigma = torch.ones_like(mu)
 
         return mu, sigma
 
@@ -215,7 +217,7 @@ class TARLManager:
                     self.device = actor_module.device
                 
                 def forward(self, obs):
-                    obs_tensor = torch.from_numpy(np.array(obs)).float().to(self.device)
+                    obs_tensor = torch.as_tensor(obs, dtype=torch.float32, device=self.device)
                     logits = self.backbone(obs_tensor)
                     dist = self.dist_net(logits)
                     return dist
@@ -231,25 +233,30 @@ class TARLManager:
                 action_dist = offline_actor(obs)
                 
                 if hasattr(action_dist, 'mean'):
-                    mu_off = action_dist.mean.detach().clone()
+                    mu_off = action_dist.mean.cpu().detach().clone()
                 elif hasattr(action_dist, 'mode'):
-                    mu_off = action_dist.mode()[0].detach().clone()
+                    mu_off = action_dist.mode()[0].cpu().detach().clone()
                 else:
-                    mu_off = action_dist.detach().clone()
+                    mu_off = action_dist.cpu().detach().clone()
                 
                 if hasattr(action_dist, 'stddev'):
-                    sigma_off = action_dist.stddev.detach().clone()
+                    sigma_off = action_dist.stddev.cpu().detach().clone()
                 elif hasattr(action_dist, 'scale'):
-                    sigma_off = action_dist.scale.detach().clone()
+                    sigma_off = action_dist.scale.cpu().detach().clone()
                 else:
                     sigma_off = torch.ones_like(mu_off)
             
             del offline_actor
+            
+            if mu_off.device != self.device:
+                mu_off = mu_off.to(self.device)
+                sigma_off = sigma_off.to(self.device)
+            
             return mu_off, sigma_off
             
         except Exception as e:
             print(f"Warning: Failed to load offline actor state: {e}")
-            return torch.zeros_like(obs[..., :1]), torch.ones_like(obs[..., :1])
+            return torch.zeros_like(obs[..., :1]).to(self.device), torch.ones_like(obs[..., :1]).to(self.device)
 
     def _compute_threshold(self) -> float:
         """
