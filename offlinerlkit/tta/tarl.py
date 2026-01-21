@@ -195,11 +195,40 @@ class TARLManager:
     def _get_offline_distribution(self, obs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Get action distribution from frozen offline policy
+        
+        Uses the saved offline policy state to compute KL divergence
+        without modifying the current policy.
         """
         self.policy.eval()
-        with torch.no_grad():
-            if hasattr(self.policy, 'actor'):
-                action_dist = self.policy.actor(obs)
+        
+        if not hasattr(self.policy, 'actor'):
+            return torch.zeros_like(obs[..., :1]), torch.ones_like(obs[..., :1])
+        
+        try:
+            actor = self.policy.actor
+            
+            class OfflineActorWrapper(nn.Module):
+                def __init__(self, actor_module):
+                    super().__init__()
+                    self.backbone = actor_module.backbone
+                    self.dist_net = actor_module.dist_net
+                    self.device = actor_module.device
+                
+                def forward(self, obs):
+                    obs = torch.as_tensor(obs, device=self.device, dtype=torch.float32)
+                    logits = self.backbone(obs)
+                    dist = self.dist_net(logits)
+                    return dist
+            
+            offline_actor = OfflineActorWrapper(actor).to(self.device)
+            offline_actor.load_state_dict({
+                k.replace('actor.', '', 1): v 
+                for k, v in self.offline_policy_state.items() 
+                if k.startswith('actor.')
+            })
+            
+            with torch.no_grad():
+                action_dist = offline_actor(obs)
                 
                 if hasattr(action_dist, 'mean'):
                     mu_off = action_dist.mean
@@ -214,8 +243,13 @@ class TARLManager:
                     sigma_off = action_dist.scale
                 else:
                     sigma_off = torch.ones_like(mu_off)
-        
-        return mu_off, sigma_off
+            
+            del offline_actor
+            return mu_off, sigma_off
+            
+        except Exception as e:
+            print(f"Warning: Failed to load offline actor state: {e}")
+            return torch.zeros_like(obs[..., :1]), torch.ones_like(obs[..., :1])
 
     def _compute_threshold(self) -> float:
         """
