@@ -12,7 +12,7 @@ import csv
 import os
 from typing import Dict, Any, List
 
-from offlinerlkit.tta import ShiftedPolicyEvaluator, run_tta_evaluation, MCATTAManager
+from offlinerlkit.tta import ShiftedPolicyEvaluator, run_tta_evaluation, MCATTAManager, TARLManager
 from offlinerlkit.policy import CQLPolicy
 
 
@@ -441,6 +441,116 @@ def run_mcatta_experiment(env_name: str, policy_checkpoint: str,
     return all_results
 
 
+def run_tarl_experiment(env_name: str, policy_checkpoint: str,
+                        shift_configs: Dict[str, Any],
+                        num_episodes: int = 20,
+                        results_csv_path: str = "./tarl_results.csv"):
+    """
+    运行TARL实验并保存结果到CSV
+    
+    TARL (Test-Time Adaptation with Reinforcement Learning) 特点：
+    - 基于动作不确定性的熵最小化
+    - 低熵样本筛选机制
+    - 仅更新LayerNorm参数保证稳定性
+    - KL散度正则化防止策略漂移
+    
+    Args:
+        env_name: 环境名称
+        policy_checkpoint: 策略检查点路径
+        shift_configs: shift配置字典
+        num_episodes: 评估回合数
+        results_csv_path: CSV结果文件路径
+    """
+    from offlinerlkit.tta.shifted_env import create_shifted_env
+    from offlinerlkit.tta.model_loader import ModelLoader
+    
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print(f"Using device: {device}")
+    print("Running TARL (Test-Time Adaptation with Reinforcement Learning)...")
+    
+    all_results = []
+    
+    for shift_name, shift_config in shift_configs.items():
+        print(f"\nTesting shift: {shift_name}")
+        print(f"Shift config: {shift_config}")
+        
+        for seed in range(3):
+            np.random.seed(seed)
+            torch.manual_seed(seed)
+            
+            env = create_shifted_env(env_name, shift_config)
+            
+            model_loader = ModelLoader(CQLPolicy, device=device)
+            env_config = {
+                'observation_space': env.observation_space,
+                'action_space': env.action_space,
+                'obs_dim': env.observation_space.shape[0],
+                'action_dim': env.action_space.shape[0]
+            }
+            policy = model_loader.load_pretrained_model(policy_checkpoint, env_config)
+            
+            tarl_config = {
+                'learning_rate': 1e-6,
+                'cache_capacity': 1000,
+                'k_low_entropy': 10,
+                'kl_weight': 1.0,
+                'gradient_clip': 0.5
+            }
+            
+            tarl_manager = TARLManager(policy, env, tarl_config)
+            adaptation_data, summary = tarl_manager.run_adaptation(num_episodes=num_episodes)
+            
+            result_row = {
+                'shift_name': shift_name,
+                'seed': seed,
+                'algorithm': 'TARL',
+                'mean_reward': summary.get('mean_reward', 0),
+                'std_reward': summary.get('std_reward', 0),
+                'mean_length': summary.get('mean_length', 0),
+                'mean_loss': summary.get('mean_loss', 0),
+                'mean_entropy': summary.get('mean_entropy', 0),
+                'mean_kl': summary.get('mean_kl', 0),
+                'cache_size': summary.get('cache_size', 0),
+                'adaptation_steps': summary.get('adaptation_steps', 0)
+            }
+            all_results.append(result_row)
+            
+            print(f"  Seed {seed}: Reward = {result_row['mean_reward']:.2f} ± {result_row['std_reward']:.2f}, "
+                  f"Loss = {result_row['mean_loss']:.6f}, "
+                  f"Entropy = {result_row['mean_entropy']:.4f}, "
+                  f"KL = {result_row['mean_kl']:.4f}")
+    
+    save_tarl_results_to_csv(all_results, results_csv_path)
+    
+    return all_results
+
+
+def save_tarl_results_to_csv(results: List[Dict], csv_path: str):
+    """保存TARL结果到CSV文件"""
+    os.makedirs(os.path.dirname(csv_path) if os.path.dirname(csv_path) else '.', exist_ok=True)
+    
+    fieldnames = ['shift_name', 'seed', 'algorithm', 'mean_reward', 'std_reward',
+                  'mean_length', 'mean_loss', 'mean_entropy', 'mean_kl',
+                  'cache_size', 'adaptation_steps']
+    
+    formatted_results = []
+    for row in results:
+        formatted_row = {}
+        for key, value in row.items():
+            if isinstance(value, float):
+                formatted_row[key] = round(value, 6)
+            else:
+                formatted_row[key] = value
+        formatted_results.append(formatted_row)
+    
+    with open(csv_path, 'w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(formatted_results)
+    
+    print(f"\nTARL results saved to: {csv_path}")
+
+
 def save_mcatta_results_to_csv(results: List[Dict], csv_path: str):
     """保存MCATTA结果到CSV文件"""
     os.makedirs(os.path.dirname(csv_path) if os.path.dirname(csv_path) else '.', exist_ok=True)
@@ -546,6 +656,21 @@ def compare_tta_strategies(env_name: str, policy_checkpoint: str,
     
     all_results.extend(mcatta_results)
     
+    print(f"\n{'='*60}")
+    print("Testing: TARL")
+    print(f"{'='*60}")
+    
+    tarl_csv_path = os.path.join(results_dir, "TARL.csv")
+    tarl_results = run_tarl_experiment(
+        env_name=env_name,
+        policy_checkpoint=policy_checkpoint,
+        shift_configs=shift_configs,
+        num_episodes=num_episodes,
+        results_csv_path=tarl_csv_path
+    )
+    
+    all_results.extend(tarl_results)
+    
     comparison_summary = generate_comparison_summary(all_results)
     summary_csv = os.path.join(results_dir, "comparison_summary.csv")
     save_comparison_summary_to_csv(comparison_summary, summary_csv)
@@ -568,6 +693,8 @@ def generate_comparison_summary(results: List[Dict]) -> Dict[str, Any]:
         for algo in algorithms:
             if algo == 'MCATTA':
                 subset = [r for r in results if r['shift_name'] == shift_name and r.get('algorithm') == 'MCATTA']
+            elif algo == 'TARL':
+                subset = [r for r in results if r['shift_name'] == shift_name and r.get('algorithm') == 'TARL']
             else:
                 subset = [r for r in results if r['shift_name'] == shift_name and r.get('tta_strategy') == algo]
             
@@ -717,6 +844,15 @@ def main():
             results_csv_path="./mcatta_results.csv"
         )
         
+        print("\n5. Running TARL Experiment...")
+        results_tarl = run_tarl_experiment(
+            env_name="hopper-medium-v2",
+            policy_checkpoint="./checkpoints/cql_hopper_medium.pt",
+            shift_configs=shift_configs,
+            num_episodes=20,
+            results_csv_path="./tarl_results.csv"
+        )
+        
         print("\n" + "=" * 80)
         print("All experiments completed successfully!")
         print("Results saved to CSV files:")
@@ -724,6 +860,7 @@ def main():
         print("  - ./tta_results_uncertainty.csv")
         print("  - ./tta_results_no_tta.csv")
         print("  - ./mcatta_results.csv")
+        print("  - ./tarl_results.csv")
         print("=" * 80)
         
     except Exception as e:
@@ -736,7 +873,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="OfflineRL-Kit TTA Framework CLI")
     parser.add_argument("--enable_tta", action="store_true", help="Enable Test-Time Adaptation (TTA)")
-    parser.add_argument("--tta_strategy", type=str, choices=["entropy_minimization", "uncertainty_minimization", "mcatta", "none"], default="entropy_minimization", help="TTA strategy to use")
+    parser.add_argument("--tta_strategy", type=str, choices=["entropy_minimization", "uncertainty_minimization", "mcatta", "tarl", "none"], default="entropy_minimization", help="TTA strategy to use")
     parser.add_argument("--env", type=str, default="hopper-medium-v2", help="Environment name (e.g., hopper-medium-v2)")
     parser.add_argument("--checkpoint", type=str, default="./checkpoints/cql_hopper_medium.pt", help="Path to policy checkpoint file")
     parser.add_argument("--episodes", type=int, default=20, help="Number of episodes per experiment")
@@ -756,7 +893,6 @@ if __name__ == "__main__":
     print(f"Output: {args.output}")
     print(f"Shifts: {args.shifts}")
 
-    # 构建 shift 配置
     shift_configs = {}
     if "normal" in args.shifts:
         shift_configs["normal"] = {}
@@ -776,6 +912,15 @@ if __name__ == "__main__":
         if args.tta_strategy == "mcatta":
             print(f"\nRunning MCATTA Experiment...")
             results = run_mcatta_experiment(
+                env_name=args.env,
+                policy_checkpoint=args.checkpoint,
+                shift_configs=shift_configs,
+                num_episodes=args.episodes,
+                results_csv_path=args.output
+            )
+        elif args.tta_strategy == "tarl":
+            print(f"\nRunning TARL Experiment...")
+            results = run_tarl_experiment(
                 env_name=args.env,
                 policy_checkpoint=args.checkpoint,
                 shift_configs=shift_configs,
