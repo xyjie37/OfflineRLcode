@@ -48,6 +48,7 @@ class TARLManager:
         self.entropy_cache = deque(maxlen=self.cache_capacity)
 
         self.offline_policy_state = self._save_policy_state()
+        self._offline_actor = None
         self.trainable_params = self._get_layernorm_params()
         self.param_names = [name for name, _ in self.trainable_params]
         
@@ -202,28 +203,29 @@ class TARLManager:
         """
         Get action distribution from frozen offline policy
         
-        Temporarily loads offline weights to compute KL divergence,
-        then restores current policy weights.
+        Uses a cached offline actor to compute KL divergence safely.
         """
         if not hasattr(self.policy, 'actor'):
             return torch.zeros_like(obs[..., :1]).requires_grad_(False), torch.ones_like(obs[..., :1]).requires_grad_(False)
         
-        self.policy.eval()
-        
         try:
-            original_state = {k: v.clone() for k, v in self.policy.actor.state_dict().items()}
-            
-            offline_state = {
-                k.replace('actor.', '', 1): v 
-                for k, v in self.offline_policy_state.items() 
-                if k.startswith('actor.')
-            }
-            
-            self.policy.actor.load_state_dict(offline_state)
+            if not hasattr(self, '_offline_actor') or self._offline_actor is None:
+                import copy
+                self._offline_actor = copy.deepcopy(self.policy.actor)
+                
+                offline_state = {
+                    k.replace('actor.', '', 1): v 
+                    for k, v in self.offline_policy_state.items() 
+                    if k.startswith('actor.')
+                }
+                
+                self._offline_actor.load_state_dict(offline_state)
+                self._offline_actor = self._offline_actor.to(self.device)
+                self._offline_actor.eval()
             
             with torch.no_grad():
                 obs_tensor = torch.as_tensor(obs, dtype=torch.float32, device=self.device)
-                action_dist = self.policy.actor(obs_tensor)
+                action_dist = self._offline_actor(obs_tensor)
                 
                 if hasattr(action_dist, 'mean'):
                     mu_off = action_dist.mean.detach().clone()
@@ -239,8 +241,6 @@ class TARLManager:
                 else:
                     sigma_off = torch.ones_like(mu_off)
             
-            self.policy.actor.load_state_dict(original_state)
-            
             mu_off = mu_off.requires_grad_(False)
             sigma_off = sigma_off.requires_grad_(False)
             
@@ -254,10 +254,6 @@ class TARLManager:
             print(f"Warning: Failed to compute offline distribution: {e}")
             import traceback
             traceback.print_exc()
-            try:
-                self.policy.actor.load_state_dict(original_state)
-            except:
-                pass
             return torch.zeros_like(obs[..., :1]).to(self.device).requires_grad_(False), torch.ones_like(obs[..., :1]).to(self.device).requires_grad_(False)
 
     def _compute_threshold(self) -> float:
