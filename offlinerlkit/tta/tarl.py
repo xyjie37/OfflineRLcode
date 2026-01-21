@@ -134,22 +134,22 @@ class TARLManager:
         action_dist = self.policy.actor(obs)
 
         if hasattr(action_dist, 'mean'):
-            mu = action_dist.mean
+            mu = action_dist.mean.detach().clone()
         elif hasattr(action_dist, 'mode'):
-            mu = action_dist.mode()[0]
+            mu = action_dist.mode()[0].detach().clone()
         else:
-            mu = action_dist
+            mu = action_dist.detach().clone()
 
         if hasattr(action_dist, 'stddev'):
-            sigma = action_dist.stddev
+            sigma = action_dist.stddev.detach().clone()
         elif hasattr(action_dist, 'scale'):
-            sigma = action_dist.scale
+            sigma = action_dist.scale.detach().clone()
         else:
             if hasattr(action_dist, 'log_std'):
                 log_std = action_dist.log_std
                 if isinstance(log_std, tuple):
                     log_std = torch.cat([ls.unsqueeze(0) for ls in log_std], dim=-1)
-                sigma = F.softplus(log_std) + 1e-6
+                sigma = F.softplus(log_std).detach().clone() + 1e-6
             else:
                 sigma = torch.ones_like(mu)
 
@@ -163,8 +163,9 @@ class TARLManager:
         
         Higher entropy indicates greater uncertainty about action selection.
         """
-        log_var = torch.log(sigma + 1e-8)
-        entropy = 0.5 * (torch.log(2 * np.pi * sigma + 1e-8) + 1)
+        sigma_detached = sigma.detach().clone()
+        log_var = torch.log(sigma_detached + 1e-8)
+        entropy = 0.5 * (torch.log(2 * np.pi * sigma_detached + 1e-8) + 1)
         return entropy.mean()
 
     def _compute_kl_divergence(
@@ -179,12 +180,17 @@ class TARLManager:
         
         KL(N_off || N_tta) = 0.5 * [σ_tta²/σ_off² + (μ_off - μ_tta)²/σ_off² - 1 + ln(σ_off²/σ_tta²)]
         """
-        var_off = sigma_off ** 2 + 1e-8
-        var_tta = sigma_tta ** 2 + 1e-8
+        mu_tta_clone = mu_tta.detach().clone()
+        sigma_tta_clone = sigma_tta.detach().clone()
+        mu_off_clone = mu_off.detach().clone()
+        sigma_off_clone = sigma_off.detach().clone()
+        
+        var_off = sigma_off_clone ** 2 + 1e-8
+        var_tta = sigma_tta_clone ** 2 + 1e-8
 
         kl = 0.5 * (
             var_tta / var_off +
-            (mu_off - mu_tta) ** 2 / var_off -
+            (mu_off_clone - mu_tta_clone) ** 2 / var_off -
             1 +
             torch.log(var_off / var_tta)
         )
@@ -291,7 +297,9 @@ class TARLManager:
         total_loss = entropy + self.kl_weight * kl_div
 
         self.optimizer.zero_grad()
-        total_loss.backward()
+        
+        with torch.autograd.detect_anomaly():
+            total_loss.backward()
 
         if self.gradient_clip > 0:
             torch.nn.utils.clip_grad_norm_(self.params_only, self.gradient_clip)
