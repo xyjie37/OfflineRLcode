@@ -48,6 +48,7 @@ class TARLManager:
         self.entropy_cache = deque(maxlen=self.cache_capacity)
 
         self.offline_policy_state = self._save_policy_state()
+        self._offline_actor = None
         self.trainable_params = self._get_layernorm_params()
         self.param_names = [name for name, _ in self.trainable_params]
         
@@ -212,30 +213,20 @@ class TARLManager:
             return torch.zeros_like(obs[..., :1]).requires_grad_(False), torch.ones_like(obs[..., :1]).requires_grad_(False)
         
         try:
-            actor = self.policy.actor
-            
-            class OfflineActorWrapper(nn.Module):
-                def __init__(self, actor_module):
-                    super().__init__()
-                    self.backbone = actor_module.backbone
-                    self.dist_net = actor_module.dist_net
-                    self.device = actor_module.device
-                
-                def forward(self, obs):
-                    obs_tensor = torch.as_tensor(obs, dtype=torch.float32, device=self.device)
-                    logits = self.backbone(obs_tensor)
-                    dist = self.dist_net(logits)
-                    return dist
-            
-            offline_actor = OfflineActorWrapper(actor).to(self.device)
-            offline_actor.load_state_dict({
-                k.replace('actor.', '', 1): v 
-                for k, v in self.offline_policy_state.items() 
-                if k.startswith('actor.')
-            })
+            if not hasattr(self, '_offline_actor') or self._offline_actor is None:
+                import copy
+                self._offline_actor = copy.deepcopy(self.policy.actor)
+                self._offline_actor.load_state_dict({
+                    k.replace('actor.', '', 1): v 
+                    for k, v in self.offline_policy_state.items() 
+                    if k.startswith('actor.')
+                })
+                self._offline_actor = self._offline_actor.to(self.device)
+                self._offline_actor.eval()
             
             with torch.no_grad():
-                action_dist = offline_actor(obs)
+                obs_tensor = torch.as_tensor(obs, dtype=torch.float32, device=self.device)
+                action_dist = self._offline_actor(obs_tensor)
                 
                 if hasattr(action_dist, 'mean'):
                     mu_off = action_dist.mean.detach().clone().requires_grad_(False)
@@ -251,8 +242,6 @@ class TARLManager:
                 else:
                     sigma_off = torch.ones_like(mu_off)
             
-            del offline_actor
-            
             if mu_off.device != self.device:
                 mu_off = mu_off.to(self.device)
                 sigma_off = sigma_off.to(self.device)
@@ -261,6 +250,8 @@ class TARLManager:
             
         except Exception as e:
             print(f"Warning: Failed to load offline actor state: {e}")
+            import traceback
+            traceback.print_exc()
             return torch.zeros_like(obs[..., :1]).to(self.device).requires_grad_(False), torch.ones_like(obs[..., :1]).to(self.device).requires_grad_(False)
 
     def _compute_threshold(self) -> float:
