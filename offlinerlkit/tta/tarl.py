@@ -131,27 +131,35 @@ class TARLManager:
         if not hasattr(self.policy, 'actor'):
             raise ValueError("Policy must have an actor module for TARL")
 
-        action_dist = self.policy.actor(obs)
+        self.policy.eval()
+        with torch.no_grad():
+            action_dist = self.policy.actor(obs)
 
-        if hasattr(action_dist, 'mean'):
-            mu = action_dist.mean
-        elif hasattr(action_dist, 'mode'):
-            mu = action_dist.mode()[0]
-        else:
-            mu = action_dist
-
-        if hasattr(action_dist, 'stddev'):
-            sigma = action_dist.stddev
-        elif hasattr(action_dist, 'scale'):
-            sigma = action_dist.scale
-        else:
-            if hasattr(action_dist, 'log_std'):
-                log_std = action_dist.log_std
-                if isinstance(log_std, tuple):
-                    log_std = torch.cat([ls.unsqueeze(0) for ls in log_std], dim=-1)
-                sigma = F.softplus(log_std) + 1e-6
+            if hasattr(action_dist, 'mean'):
+                mu = action_dist.mean
+            elif hasattr(action_dist, 'mode'):
+                mu = action_dist.mode()[0]
             else:
-                sigma = torch.ones_like(mu)
+                mu = action_dist
+
+            if hasattr(action_dist, 'stddev'):
+                sigma = action_dist.stddev
+            elif hasattr(action_dist, 'scale'):
+                sigma = action_dist.scale
+            else:
+                if hasattr(action_dist, 'log_std'):
+                    log_std = action_dist.log_std
+                    if isinstance(log_std, tuple):
+                        log_std = torch.cat([ls.unsqueeze(0) for ls in log_std], dim=-1)
+                    sigma = F.softplus(log_std) + 1e-6
+                else:
+                    sigma = torch.ones_like(mu)
+
+        mu = mu.clone().requires_grad_(True)
+        if sigma.requires_grad:
+            sigma = sigma.clone()
+        else:
+            sigma = sigma.clone().requires_grad_(True)
 
         return mu, sigma
 
@@ -201,7 +209,7 @@ class TARLManager:
         self.policy.eval()
         
         if not hasattr(self.policy, 'actor'):
-            return torch.zeros_like(obs[..., :1]), torch.ones_like(obs[..., :1])
+            return torch.zeros_like(obs[..., :1]).requires_grad_(False), torch.ones_like(obs[..., :1]).requires_grad_(False)
         
         try:
             actor = self.policy.actor
@@ -230,16 +238,16 @@ class TARLManager:
                 action_dist = offline_actor(obs)
                 
                 if hasattr(action_dist, 'mean'):
-                    mu_off = action_dist.mean.cpu().detach().clone()
+                    mu_off = action_dist.mean.detach().clone().requires_grad_(False)
                 elif hasattr(action_dist, 'mode'):
-                    mu_off = action_dist.mode()[0].cpu().detach().clone()
+                    mu_off = action_dist.mode()[0].detach().clone().requires_grad_(False)
                 else:
-                    mu_off = action_dist.cpu().detach().clone()
+                    mu_off = action_dist.detach().clone().requires_grad_(False)
                 
                 if hasattr(action_dist, 'stddev'):
-                    sigma_off = action_dist.stddev.cpu().detach().clone()
+                    sigma_off = action_dist.stddev.detach().clone().requires_grad_(False)
                 elif hasattr(action_dist, 'scale'):
-                    sigma_off = action_dist.scale.cpu().detach().clone()
+                    sigma_off = action_dist.scale.detach().clone().requires_grad_(False)
                 else:
                     sigma_off = torch.ones_like(mu_off)
             
@@ -253,7 +261,7 @@ class TARLManager:
             
         except Exception as e:
             print(f"Warning: Failed to load offline actor state: {e}")
-            return torch.zeros_like(obs[..., :1]).to(self.device), torch.ones_like(obs[..., :1]).to(self.device)
+            return torch.zeros_like(obs[..., :1]).to(self.device).requires_grad_(False), torch.ones_like(obs[..., :1]).to(self.device).requires_grad_(False)
 
     def _compute_threshold(self) -> float:
         """
