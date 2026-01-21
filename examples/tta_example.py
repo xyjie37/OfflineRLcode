@@ -732,23 +732,73 @@ def main():
 
 
 if __name__ == "__main__":
-    import sys
-    
-    if len(sys.argv) > 1 and sys.argv[1] == 'mcatta':
-        mcatta_demo()
-    elif len(sys.argv) > 1 and sys.argv[1] == 'compare':
-        compare_tta_strategies(
-            env_name="hopper-medium-v2",
-            policy_checkpoint="./checkpoints/cql_hopper_medium.pt",
-            shift_configs={
-                'normal': {},
-                'light_mass': {'dynamic_shifts': {'mass_scale': 0.8}},
-                'heavy_mass': {'dynamic_shifts': {'mass_scale': 1.5}},
-                'low_friction': {'dynamic_shifts': {'friction_scale': 0.5}},
-                'observation_noise': {'observation_shifts': {'noise_std': 0.1}}
-            },
-            num_episodes=20,
-            results_dir="./tta_comparison_results"
-        )
-    else:
-        main()
+    import argparse
+
+    parser = argparse.ArgumentParser(description="OfflineRL-Kit TTA Framework CLI")
+    parser.add_argument("--enable_tta", action="store_true", help="Enable Test-Time Adaptation (TTA)")
+    parser.add_argument("--tta_strategy", type=str, choices=["entropy_minimization", "uncertainty_minimization", "mcatta", "none"], default="entropy_minimization", help="TTA strategy to use")
+    parser.add_argument("--env", type=str, default="hopper-medium-v2", help="Environment name (e.g., hopper-medium-v2)")
+    parser.add_argument("--checkpoint", type=str, default="./checkpoints/cql_hopper_medium.pt", help="Path to policy checkpoint file")
+    parser.add_argument("--episodes", type=int, default=20, help="Number of episodes per experiment")
+    parser.add_argument("--output", type=str, default="./tta_results.csv", help="Output CSV file path for results")
+    parser.add_argument("--shifts", type=str, nargs="+", default=["light_mass", "heavy_mass", "low_friction", "observation_noise"], help="List of shift configurations to test")
+
+    args = parser.parse_args()
+
+    print("=" * 80)
+    print("OfflineRL-Kit TTA Framework CLI")
+    print("=" * 80)
+    print(f"Environment: {args.env}")
+    print(f"Checkpoint: {args.checkpoint}")
+    print(f"Episodes: {args.episodes}")
+    print(f"TTA Enabled: {args.enable_tta}")
+    print(f"TTA Strategy: {args.tta_strategy}")
+    print(f"Output: {args.output}")
+    print(f"Shifts: {args.shifts}")
+
+    # 构建 shift 配置
+    shift_configs = {}
+    if "normal" in args.shifts:
+        shift_configs["normal"] = {}
+    if "light_mass" in args.shifts:
+        shift_configs["light_mass"] = {"dynamic_shifts": {"mass_scale": 0.8}}
+    if "heavy_mass" in args.shifts:
+        shift_configs["heavy_mass"] = {"dynamic_shifts": {"mass_scale": 1.5}}
+    if "low_friction" in args.shifts:
+        shift_configs["low_friction"] = {"dynamic_shifts": {"friction_scale": 0.5}}
+    if "observation_noise" in args.shifts:
+        shift_configs["observation_noise"] = {"observation_shifts": {"noise_std": 0.1}}
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Using device: {device}")
+
+    try:
+        if args.tta_strategy == "mcatta":
+            print(f"\nRunning MCATTA Experiment...")
+            results = run_mcatta_experiment(
+                env_name=args.env,
+                policy_checkpoint=args.checkpoint,
+                shift_configs=shift_configs,
+                num_episodes=args.episodes,
+                results_csv_path=args.output
+            )
+        else:
+            print(f"\nRunning TTA Experiment with strategy: {args.tta_strategy}")
+            results = run_tta_experiment(
+                env_name=args.env,
+                policy_checkpoint=args.checkpoint,
+                shift_configs=shift_configs,
+                enable_tta=args.enable_tta,
+                tta_strategy=args.tta_strategy,
+                num_episodes=args.episodes,
+                results_csv_path=args.output
+            )
+
+        print("\n" + "=" * 80)
+        print("Experiment completed successfully!")
+        print(f"Results saved to: {args.output}")
+        print("=" * 80)
+
+    except Exception as e:
+        print(f"Error running experiment: {e}")
+        print("Make sure you have the required checkpoints and dependencies.")
