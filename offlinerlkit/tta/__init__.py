@@ -10,6 +10,7 @@ from offlinerlkit.tta.model_loader import ModelLoader
 from offlinerlkit.tta.tta_manager import TTAManager
 from offlinerlkit.tta.evaluator import ShiftedPolicyEvaluator, run_tta_evaluation
 from offlinerlkit.tta.mcatta import MCATTAManager, PerformancePredictor, PolicyCache
+from offlinerlkit.tta.tarl import TARLManager
 
 __all__ = [
     "ShiftedMujocoEnvWrapper",
@@ -19,5 +20,6 @@ __all__ = [
     "run_tta_evaluation",
     "MCATTAManager",
     "PerformancePredictor",
-    "PolicyCache"
+    "PolicyCache",
+    "TARLManager"
 ]
