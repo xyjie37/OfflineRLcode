@@ -131,29 +131,27 @@ class TARLManager:
         if not hasattr(self.policy, 'actor'):
             raise ValueError("Policy must have an actor module for TARL")
 
-        self.policy.eval()
-        with torch.no_grad():
-            action_dist = self.policy.actor(obs)
+        action_dist = self.policy.actor(obs)
 
-            if hasattr(action_dist, 'mean'):
-                mu = action_dist.mean.detach().clone()
-            elif hasattr(action_dist, 'mode'):
-                mu = action_dist.mode()[0].detach().clone()
-            else:
-                mu = action_dist.detach().clone()
+        if hasattr(action_dist, 'mean'):
+            mu = action_dist.mean
+        elif hasattr(action_dist, 'mode'):
+            mu = action_dist.mode()[0]
+        else:
+            mu = action_dist
 
-            if hasattr(action_dist, 'stddev'):
-                sigma = action_dist.stddev.detach().clone()
-            elif hasattr(action_dist, 'scale'):
-                sigma = action_dist.scale.detach().clone()
+        if hasattr(action_dist, 'stddev'):
+            sigma = action_dist.stddev
+        elif hasattr(action_dist, 'scale'):
+            sigma = action_dist.scale
+        else:
+            if hasattr(action_dist, 'log_std'):
+                log_std = action_dist.log_std
+                if isinstance(log_std, tuple):
+                    log_std = torch.cat([ls.unsqueeze(0) for ls in log_std], dim=-1)
+                sigma = F.softplus(log_std) + 1e-6
             else:
-                if hasattr(action_dist, 'log_std'):
-                    log_std = action_dist.log_std
-                    if isinstance(log_std, tuple):
-                        log_std = torch.cat([ls.unsqueeze(0) for ls in log_std], dim=-1)
-                    sigma = F.softplus(log_std).detach().clone() + 1e-6
-                else:
-                    sigma = torch.ones_like(mu)
+                sigma = torch.ones_like(mu)
 
         return mu, sigma
 
@@ -171,7 +169,8 @@ class TARLManager:
 
     def _compute_kl_divergence(
         self,
-        obs: torch.Tensor,
+        mu_tta: torch.Tensor,
+        sigma_tta: torch.Tensor,
         mu_off: torch.Tensor,
         sigma_off: torch.Tensor
     ) -> torch.Tensor:
@@ -180,8 +179,6 @@ class TARLManager:
         
         KL(N_off || N_tta) = 0.5 * [σ_tta²/σ_off² + (μ_off - μ_tta)²/σ_off² - 1 + ln(σ_off²/σ_tta²)]
         """
-        mu_tta, sigma_tta = self._compute_action_distribution(obs)
-
         var_off = sigma_off ** 2 + 1e-8
         var_tta = sigma_tta ** 2 + 1e-8
 
@@ -289,7 +286,7 @@ class TARLManager:
         entropy = self._compute_entropy(sigma_tta)
 
         mu_off, sigma_off = self._get_offline_distribution(obs_batch)
-        kl_div = self._compute_kl_divergence(obs_batch, mu_off, sigma_off)
+        kl_div = self._compute_kl_divergence(mu_tta, sigma_tta, mu_off, sigma_off)
 
         total_loss = entropy + self.kl_weight * kl_div
 
