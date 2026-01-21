@@ -53,10 +53,14 @@ class TARLManager:
         self.param_names = [name for name, _ in self.trainable_params]
         
         if len(self.trainable_params) == 0:
-            print("Warning: No LayerNorm parameters found in policy. "
+            print("Debug: No LayerNorm parameters found in policy. "
                   "Falling back to all actor parameters with reduced learning rate.")
             self.trainable_params = self._get_actor_params()
             self.param_names = [name for name, _ in self.trainable_params]
+        
+        print(f"Debug: Found {len(self.trainable_params)} trainable parameters")
+        for name, param in self.trainable_params[:5]:
+            print(f"  - {name}: requires_grad={param.requires_grad}, shape={param.shape}")
         
         params_only = [param for _, param in self.trainable_params]
         self.params_only = params_only
@@ -155,12 +159,6 @@ class TARLManager:
             else:
                 sigma = torch.ones_like(mu)
 
-        mu = mu.clone().requires_grad_(True)
-        if sigma.requires_grad:
-            sigma = sigma.clone()
-        else:
-            sigma = sigma.clone().requires_grad_(True)
-
         return mu, sigma
 
     def _compute_entropy(self, sigma: torch.Tensor) -> torch.Tensor:
@@ -222,6 +220,8 @@ class TARLManager:
                 self._offline_actor.load_state_dict(offline_state)
                 self._offline_actor = self._offline_actor.to(self.device)
                 self._offline_actor.eval()
+                
+                print(f"Debug: Created offline actor with {sum(1 for _ in self._offline_actor.parameters())} parameters")
             
             with torch.no_grad():
                 obs_tensor = torch.as_tensor(obs, dtype=torch.float32, device=self.device)
@@ -283,21 +283,39 @@ class TARLManager:
         self.policy.train()
 
         mu_tta, sigma_tta = self._compute_action_distribution(obs_batch)
-
+        
+        assert mu_tta.requires_grad, "mu_tta must require grad!"
+        assert sigma_tta.requires_grad, "sigma_tta must require grad!"
+        
         entropy = self._compute_entropy(sigma_tta)
 
         mu_off, sigma_off = self._get_offline_distribution(obs_batch)
         kl_div = self._compute_kl_divergence(mu_tta, sigma_tta, mu_off, sigma_off)
+        
+        mu_diff = (mu_off - mu_tta).abs().mean().item()
+        if mu_diff < 1e-6:
+            print(f"  DEBUG: mu_off - mu_tta diff = {mu_diff:.8f}, KL = {kl_div.item():.6f}")
 
         total_loss = entropy + self.kl_weight * kl_div
 
         self.optimizer.zero_grad()
         total_loss.backward()
         
-        has_grad = any(p.grad is not None and p.grad.abs().sum() > 0 
-                       for p in self.params_only)
-        if not has_grad:
-            print(f"  WARNING: No gradients in trainable parameters! KL={kl_div.item():.6f}, Entropy={entropy.item():.6f}")
+        grad_norms = []
+        for name, param in zip(self.param_names, self.params_only):
+            if param.grad is not None:
+                norm = param.grad.norm().item()
+                grad_norms.append(f"{name.split('.')[-1]}: {norm:.8f}")
+        
+        if grad_norms:
+            print(f"  Grad norms: {' | '.join(grad_norms)}")
+        
+        has_nonzero_grad = any(
+            p.grad is not None and p.grad.abs().sum() > 0
+            for p in self.params_only
+        )
+        if not has_nonzero_grad:
+            print(f"  WARNING: ZERO GRADIENT! KL={kl_div.item():.6f}, Entropy={entropy.item():.6f}, mu_diff={mu_diff:.8f}")
 
         if self.gradient_clip > 0:
             torch.nn.utils.clip_grad_norm_(self.params_only, self.gradient_clip)
