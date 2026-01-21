@@ -215,8 +215,8 @@ class TARLManager:
                     self.device = actor_module.device
                 
                 def forward(self, obs):
-                    obs = torch.as_tensor(obs, device=self.device, dtype=torch.float32)
-                    logits = self.backbone(obs)
+                    obs_tensor = torch.from_numpy(np.array(obs)).float().to(self.device)
+                    logits = self.backbone(obs_tensor)
                     dist = self.dist_net(logits)
                     return dist
             
@@ -231,16 +231,16 @@ class TARLManager:
                 action_dist = offline_actor(obs)
                 
                 if hasattr(action_dist, 'mean'):
-                    mu_off = action_dist.mean
+                    mu_off = action_dist.mean.detach().clone()
                 elif hasattr(action_dist, 'mode'):
-                    mu_off = action_dist.mode()[0]
+                    mu_off = action_dist.mode()[0].detach().clone()
                 else:
-                    mu_off = action_dist
+                    mu_off = action_dist.detach().clone()
                 
                 if hasattr(action_dist, 'stddev'):
-                    sigma_off = action_dist.stddev
+                    sigma_off = action_dist.stddev.detach().clone()
                 elif hasattr(action_dist, 'scale'):
-                    sigma_off = action_dist.scale
+                    sigma_off = action_dist.scale.detach().clone()
                 else:
                     sigma_off = torch.ones_like(mu_off)
             
