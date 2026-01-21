@@ -55,10 +55,12 @@ class TARLManager:
             print("Warning: No LayerNorm parameters found in policy. "
                   "Falling back to all actor parameters with reduced learning rate.")
             self.trainable_params = self._get_actor_params()
-            self.learning_rate = self.config.get('learning_rate', 1e-6)
+            self.param_names = [name for name, _ in self.trainable_params]
+        
+        params_only = [param for _, param in self.trainable_params]
         
         self.optimizer = torch.optim.Adam(
-            self.trainable_params,
+            params_only,
             lr=self.learning_rate
         )
 
