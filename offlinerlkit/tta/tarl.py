@@ -58,6 +58,7 @@ class TARLManager:
             self.param_names = [name for name, _ in self.trainable_params]
         
         params_only = [param for _, param in self.trainable_params]
+        self.params_only = params_only
         
         self.optimizer = torch.optim.Adam(
             params_only,
@@ -255,7 +256,7 @@ class TARLManager:
         total_loss.backward()
 
         if self.gradient_clip > 0:
-            torch.nn.utils.clip_grad_norm_(self.trainable_params, self.gradient_clip)
+            torch.nn.utils.clip_grad_norm_(self.params_only, self.gradient_clip)
 
         self.optimizer.step()
 
