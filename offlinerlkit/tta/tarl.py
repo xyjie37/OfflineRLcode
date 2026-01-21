@@ -50,7 +50,13 @@ class TARLManager:
         self.offline_policy_state = self._save_policy_state()
         self.trainable_params = self._get_layernorm_params()
         self.param_names = [name for name, _ in self.trainable_params]
-
+        
+        if len(self.trainable_params) == 0:
+            print("Warning: No LayerNorm parameters found in policy. "
+                  "Falling back to all actor parameters with reduced learning rate.")
+            self.trainable_params = self._get_actor_params()
+            self.learning_rate = self.config.get('learning_rate', 1e-6)
+        
         self.optimizer = torch.optim.Adam(
             self.trainable_params,
             lr=self.learning_rate
@@ -90,6 +96,22 @@ class TARLManager:
                     full_name = f"{name}.{param_name}" if name else param_name
                     if param.requires_grad:
                         trainable_params.append((full_name, param))
+        return trainable_params
+    
+    def _get_actor_params(self) -> List[Tuple[str, nn.Parameter]]:
+        """
+        Fallback: Get all parameters from actor module
+        
+        Used when no LayerNorm parameters are found in the policy.
+        This provides a more aggressive adaptation strategy.
+        """
+        if not hasattr(self.policy, 'actor'):
+            return []
+        
+        trainable_params = []
+        for name, param in self.policy.actor.named_parameters():
+            if param.requires_grad:
+                trainable_params.append((name, param))
         return trainable_params
 
     def _compute_action_distribution(self, obs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
