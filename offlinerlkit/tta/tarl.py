@@ -48,7 +48,6 @@ class TARLManager:
         self.entropy_cache = deque(maxlen=self.cache_capacity)
 
         self.offline_policy_state = self._save_policy_state()
-        self._offline_actor = None
         self.trainable_params = self._get_layernorm_params()
         self.param_names = [name for name, _ in self.trainable_params]
         
@@ -132,29 +131,28 @@ class TARLManager:
         if not hasattr(self.policy, 'actor'):
             raise ValueError("Policy must have an actor module for TARL")
 
-        self.policy.eval()
-        with torch.no_grad():
-            action_dist = self.policy.actor(obs)
+        self.policy.train()
+        action_dist = self.policy.actor(obs)
 
-            if hasattr(action_dist, 'mean'):
-                mu = action_dist.mean
-            elif hasattr(action_dist, 'mode'):
-                mu = action_dist.mode()[0]
-            else:
-                mu = action_dist
+        if hasattr(action_dist, 'mean'):
+            mu = action_dist.mean
+        elif hasattr(action_dist, 'mode'):
+            mu = action_dist.mode()[0]
+        else:
+            mu = action_dist
 
-            if hasattr(action_dist, 'stddev'):
-                sigma = action_dist.stddev
-            elif hasattr(action_dist, 'scale'):
-                sigma = action_dist.scale
+        if hasattr(action_dist, 'stddev'):
+            sigma = action_dist.stddev
+        elif hasattr(action_dist, 'scale'):
+            sigma = action_dist.scale
+        else:
+            if hasattr(action_dist, 'log_std'):
+                log_std = action_dist.log_std
+                if isinstance(log_std, tuple):
+                    log_std = torch.cat([ls.unsqueeze(0) for ls in log_std], dim=-1)
+                sigma = F.softplus(log_std) + 1e-6
             else:
-                if hasattr(action_dist, 'log_std'):
-                    log_std = action_dist.log_std
-                    if isinstance(log_std, tuple):
-                        log_std = torch.cat([ls.unsqueeze(0) for ls in log_std], dim=-1)
-                    sigma = F.softplus(log_std) + 1e-6
-                else:
-                    sigma = torch.ones_like(mu)
+                sigma = torch.ones_like(mu)
 
         mu = mu.clone().requires_grad_(True)
         if sigma.requires_grad:
@@ -204,43 +202,47 @@ class TARLManager:
         """
         Get action distribution from frozen offline policy
         
-        Uses the saved offline policy state to compute KL divergence
-        without modifying the current policy.
+        Temporarily loads offline weights to compute KL divergence,
+        then restores current policy weights.
         """
-        self.policy.eval()
-        
         if not hasattr(self.policy, 'actor'):
             return torch.zeros_like(obs[..., :1]).requires_grad_(False), torch.ones_like(obs[..., :1]).requires_grad_(False)
         
+        self.policy.eval()
+        
         try:
-            if not hasattr(self, '_offline_actor') or self._offline_actor is None:
-                import copy
-                self._offline_actor = copy.deepcopy(self.policy.actor)
-                self._offline_actor.load_state_dict({
-                    k.replace('actor.', '', 1): v 
-                    for k, v in self.offline_policy_state.items() 
-                    if k.startswith('actor.')
-                })
-                self._offline_actor = self._offline_actor.to(self.device)
-                self._offline_actor.eval()
+            original_state = {k: v.clone() for k, v in self.policy.actor.state_dict().items()}
+            
+            offline_state = {
+                k.replace('actor.', '', 1): v 
+                for k, v in self.offline_policy_state.items() 
+                if k.startswith('actor.')
+            }
+            
+            self.policy.actor.load_state_dict(offline_state)
             
             with torch.no_grad():
                 obs_tensor = torch.as_tensor(obs, dtype=torch.float32, device=self.device)
-                action_dist = self._offline_actor(obs_tensor)
+                action_dist = self.policy.actor(obs_tensor)
                 
                 if hasattr(action_dist, 'mean'):
-                    mu_off = action_dist.mean.detach().clone().requires_grad_(False)
+                    mu_off = action_dist.mean.detach().clone()
                 elif hasattr(action_dist, 'mode'):
-                    mu_off = action_dist.mode()[0].detach().clone().requires_grad_(False)
+                    mu_off = action_dist.mode()[0].detach().clone()
                 else:
-                    mu_off = action_dist.detach().clone().requires_grad_(False)
+                    mu_off = action_dist.detach().clone()
                 
                 if hasattr(action_dist, 'stddev'):
-                    sigma_off = action_dist.stddev.detach().clone().requires_grad_(False)
+                    sigma_off = action_dist.stddev.detach().clone()
                 elif hasattr(action_dist, 'scale'):
-                    sigma_off = action_dist.scale.detach().clone().requires_grad_(False)
+                    sigma_off = action_dist.scale.detach().clone()
                 else:
                     sigma_off = torch.ones_like(mu_off)
+            
+            self.policy.actor.load_state_dict(original_state)
+            
+            mu_off = mu_off.requires_grad_(False)
+            sigma_off = sigma_off.requires_grad_(False)
             
             if mu_off.device != self.device:
                 mu_off = mu_off.to(self.device)
@@ -249,9 +251,13 @@ class TARLManager:
             return mu_off, sigma_off
             
         except Exception as e:
-            print(f"Warning: Failed to load offline actor state: {e}")
+            print(f"Warning: Failed to compute offline distribution: {e}")
             import traceback
             traceback.print_exc()
+            try:
+                self.policy.actor.load_state_dict(original_state)
+            except:
+                pass
             return torch.zeros_like(obs[..., :1]).to(self.device).requires_grad_(False), torch.ones_like(obs[..., :1]).to(self.device).requires_grad_(False)
 
     def _compute_threshold(self) -> float:
@@ -291,6 +297,11 @@ class TARLManager:
 
         self.optimizer.zero_grad()
         total_loss.backward()
+        
+        has_grad = any(p.grad is not None and p.grad.abs().sum() > 0 
+                       for p in self.params_only)
+        if not has_grad:
+            print(f"  WARNING: No gradients in trainable parameters! KL={kl_div.item():.6f}, Entropy={entropy.item():.6f}")
 
         if self.gradient_clip > 0:
             torch.nn.utils.clip_grad_norm_(self.params_only, self.gradient_clip)
