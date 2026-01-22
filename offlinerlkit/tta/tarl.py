@@ -1,4 +1,5 @@
 import torch
+import copy
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
@@ -42,25 +43,29 @@ class TARLManager:
         self.cache_capacity = self.config.get('cache_capacity', 1000)
         self.k_low_entropy = self.config.get('k_low_entropy', 10)
         self.kl_weight = self.config.get('kl_weight', 1.0)
-        self.gradient_clip = self.config.get('gradient_clip', 0.5)
+        self.last_n_layers = self.config.get('last_n_layers', 2)
+        self.adaptation_mode = self.config.get('adaptation_mode', 'layernorm')
 
         self.state_cache = deque(maxlen=self.cache_capacity)
         self.entropy_cache = deque(maxlen=self.cache_capacity)
 
+        self._offline_policy_saved = True
         self.offline_policy_state = self._save_policy_state()
-        self._offline_actor = None
-        self.trainable_params = self._get_layernorm_params()
-        self.param_names = [name for name, _ in self.trainable_params]
+        self._offline_actor = self._create_frozen_actor()
         
-        if len(self.trainable_params) == 0:
-            print("Debug: No LayerNorm parameters found in policy. "
-                  "Falling back to all actor parameters with reduced learning rate.")
-            self.trainable_params = self._get_actor_params()
+        if self.adaptation_mode == 'layernorm':
+            self.trainable_params = self._get_layernorm_params()
+            self.param_names = [name for name, _ in self.trainable_params]
+            
+            if len(self.trainable_params) == 0:
+                print("警告: 未找到LayerNorm参数，自动切换到last_n_layers模式")
+                self.adaptation_mode = 'last_n_layers'
+        
+        if self.adaptation_mode == 'last_n_layers':
+            self.trainable_params = self._get_last_n_layers(self.last_n_layers)
             self.param_names = [name for name, _ in self.trainable_params]
         
-        print(f"Debug: Found {len(self.trainable_params)} trainable parameters")
-        for name, param in self.trainable_params[:5]:
-            print(f"  - {name}: requires_grad={param.requires_grad}, shape={param.shape}")
+        assert len(self.trainable_params) > 0, "无法找到可训练参数，请检查adaptation_mode配置"
         
         params_only = [param for _, param in self.trainable_params]
         self.params_only = params_only
@@ -83,6 +88,33 @@ class TARLManager:
         else:
             return torch.device('cpu')
 
+    def _create_frozen_actor(self):
+        """Create a frozen copy of the actor for offline policy"""
+        if not hasattr(self.policy, 'actor'):
+            return None
+        
+        offline_actor = copy.deepcopy(self.policy.actor)
+        
+        offline_state = {
+            k: v 
+            for k, v in self.offline_policy_state.items() 
+            if k.startswith('actor.')
+        }
+        
+        mapped_state = {}
+        for key, value in offline_state.items():
+            new_key = key.replace('actor.', '', 1)
+            mapped_state[new_key] = value
+        
+        offline_actor.load_state_dict(mapped_state, strict=True)
+        offline_actor = offline_actor.to(self.device)
+        offline_actor.eval()
+        
+        for param in offline_actor.parameters():
+            param.requires_grad = False
+        
+        return offline_actor
+
     def _save_policy_state(self) -> Dict[str, torch.Tensor]:
         """Save current policy state for KL divergence computation"""
         state = {}
@@ -98,30 +130,59 @@ class TARLManager:
         policy collapse while allowing distribution shift adaptation.
         """
         trainable_params = []
-        for name, module in self.policy.named_modules():
+        
+        if not hasattr(self.policy, 'actor'):
+            return trainable_params
+        
+        for name, module in self.policy.actor.named_modules():
             if isinstance(module, nn.LayerNorm):
                 for param_name, param in module.named_parameters():
-                    full_name = f"{name}.{param_name}" if name else param_name
+                    full_name = f"actor.{name}.{param_name}" if name else f"actor.{param_name}"
                     if param.requires_grad:
                         trainable_params.append((full_name, param))
         return trainable_params
     
-    def _get_actor_params(self) -> List[Tuple[str, nn.Parameter]]:
+    def _get_last_n_layers(self, n: int = 2) -> List[Tuple[str, nn.Parameter]]:
         """
-        Fallback: Get all parameters from actor module
+        Get parameters from the last N layers of the actor network
         
-        Used when no LayerNorm parameters are found in the policy.
-        This provides a more aggressive adaptation strategy.
+        This provides an alternative adaptation strategy when LayerNorm is not available.
+        Updates are restricted to the final layers to prevent catastrophic forgetting.
+        
+        Args:
+            n: Number of last layers to include
+            
+        Returns:
+            List of (name, parameter) tuples for trainable parameters
         """
         if not hasattr(self.policy, 'actor'):
             return []
         
         trainable_params = []
-        for name, param in self.policy.actor.named_parameters():
-            if param.requires_grad:
-                trainable_params.append((name, param))
+        
+        if hasattr(self.policy.actor, 'backbone'):
+            backbone_params = list(self.policy.actor.backbone.named_parameters())
+            if len(backbone_params) >= n:
+                selected_params = backbone_params[-n:]
+            else:
+                selected_params = backbone_params
+            
+            for name, param in selected_params:
+                if param.requires_grad:
+                    trainable_params.append((f"backbone.{name}", param))
+        
+        if hasattr(self.policy.actor, 'last'):
+            for name, param in self.policy.actor.last.named_parameters():
+                if param.requires_grad:
+                    trainable_params.append((f"last.{name}", param))
+        
+        if hasattr(self.policy.actor, 'dist_net'):
+            for name, param in self.policy.actor.dist_net.named_parameters():
+                if param.requires_grad:
+                    trainable_params.append((f"dist_net.{name}", param))
+        
         return trainable_params
-
+    
     def _compute_action_distribution(self, obs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Compute action distribution parameters for Gaussian policy
@@ -169,8 +230,7 @@ class TARLManager:
         
         Higher entropy indicates greater uncertainty about action selection.
         """
-        log_var = torch.log(sigma + 1e-8)
-        entropy = 0.5 * (torch.log(2 * np.pi * sigma + 1e-8) + 1)
+        entropy = 0.5 * (torch.log(2 * np.pi * sigma**2 + 1e-8) + 1)
         return entropy.mean()
 
     def _compute_kl_divergence(
@@ -194,7 +254,7 @@ class TARLManager:
             1 +
             torch.log(var_off / var_tta)
         )
-
+        
         return kl.mean()
 
     def _get_offline_distribution(self, obs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -203,26 +263,10 @@ class TARLManager:
         
         Uses a cached offline actor to compute KL divergence safely.
         """
-        if not hasattr(self.policy, 'actor'):
+        if not hasattr(self.policy, 'actor') or self._offline_actor is None:
             return torch.zeros_like(obs[..., :1]).requires_grad_(False), torch.ones_like(obs[..., :1]).requires_grad_(False)
         
         try:
-            if not hasattr(self, '_offline_actor') or self._offline_actor is None:
-                import copy
-                self._offline_actor = copy.deepcopy(self.policy.actor)
-                
-                offline_state = {
-                    k.replace('actor.', '', 1): v 
-                    for k, v in self.offline_policy_state.items() 
-                    if k.startswith('actor.')
-                }
-                
-                self._offline_actor.load_state_dict(offline_state)
-                self._offline_actor = self._offline_actor.to(self.device)
-                self._offline_actor.eval()
-                
-                print(f"Debug: Created offline actor with {sum(1 for _ in self._offline_actor.parameters())} parameters")
-            
             with torch.no_grad():
                 obs_tensor = torch.as_tensor(obs, dtype=torch.float32, device=self.device)
                 action_dist = self._offline_actor(obs_tensor)
@@ -251,25 +295,7 @@ class TARLManager:
             return mu_off, sigma_off
             
         except Exception as e:
-            print(f"Warning: Failed to compute offline distribution: {e}")
-            import traceback
-            traceback.print_exc()
             return torch.zeros_like(obs[..., :1]).to(self.device).requires_grad_(False), torch.ones_like(obs[..., :1]).to(self.device).requires_grad_(False)
-
-    def _compute_threshold(self) -> float:
-        """
-        Compute entropy threshold E_0 as the k-th smallest entropy value
-        
-        Only samples with entropy below this threshold participate in
-        gradient updates.
-        """
-        if len(self.entropy_cache) < self.k_low_entropy:
-            return float('inf')
-
-        entropies = list(self.entropy_cache)
-        sorted_entropies = sorted(entropies)
-        threshold = sorted_entropies[self.k_low_entropy - 1]
-        return threshold
 
     def _update(self, obs_batch: torch.Tensor):
         """
@@ -281,7 +307,7 @@ class TARLManager:
         - L_kl^t: KL divergence between offline and adapted policies
         """
         self.policy.train()
-
+        
         mu_tta, sigma_tta = self._compute_action_distribution(obs_batch)
         
         assert mu_tta.requires_grad, "mu_tta must require grad!"
@@ -293,32 +319,19 @@ class TARLManager:
         kl_div = self._compute_kl_divergence(mu_tta, sigma_tta, mu_off, sigma_off)
         
         mu_diff = (mu_off - mu_tta).abs().mean().item()
-        if mu_diff < 1e-6:
-            print(f"  DEBUG: mu_off - mu_tta diff = {mu_diff:.8f}, KL = {kl_div.item():.6f}")
-
+        sigma_diff = (sigma_off - sigma_tta).abs().mean().item()
+        
         total_loss = entropy + self.kl_weight * kl_div
 
         self.optimizer.zero_grad()
         total_loss.backward()
-        
-        grad_norms = []
-        for name, param in zip(self.param_names, self.params_only):
-            if param.grad is not None:
-                norm = param.grad.norm().item()
-                grad_norms.append(f"{name.split('.')[-1]}: {norm:.8f}")
-        
-        if grad_norms:
-            print(f"  Grad norms: {' | '.join(grad_norms)}")
         
         has_nonzero_grad = any(
             p.grad is not None and p.grad.abs().sum() > 0
             for p in self.params_only
         )
         if not has_nonzero_grad:
-            print(f"  WARNING: ZERO GRADIENT! KL={kl_div.item():.6f}, Entropy={entropy.item():.6f}, mu_diff={mu_diff:.8f}")
-
-        if self.gradient_clip > 0:
-            torch.nn.utils.clip_grad_norm_(self.params_only, self.gradient_clip)
+            print(f"  WARNING: ZERO GRADIENT! KL={kl_div.item():.6f}, Entropy={entropy.item():.6f}")
 
         self.optimizer.step()
 
@@ -330,15 +343,17 @@ class TARLManager:
 
     def _filter_low_entropy_samples(self, obs_batch: torch.Tensor) -> torch.Tensor:
         """
-        Filter samples based on entropy threshold
+        Filter samples based on entropy threshold within current batch
         
         Returns observations with entropy below E_0
         """
         _, sigma = self._compute_action_distribution(obs_batch)
-        entropies = 0.5 * (torch.log(2 * np.pi * sigma + 1e-8) + 1)
+        entropies = 0.5 * (torch.log(2 * np.pi * sigma**2 + 1e-8) + 1)
         entropies = entropies.mean(dim=-1)
 
-        threshold = self._compute_threshold()
+        k = min(self.k_low_entropy, len(obs_batch))
+        threshold = torch.kthvalue(entropies, k).values
+        
         mask = entropies <= threshold
 
         if mask.sum() == 0:
@@ -347,7 +362,7 @@ class TARLManager:
         return obs_batch[mask]
 
     def _run_single_episode(self) -> Dict[str, Any]:
-        """Run a single episode and collect state data"""
+        """Run a single episode and collect state data and perform updates"""
         reset_result = self.env.reset()
         if isinstance(reset_result, tuple):
             obs, _ = reset_result
@@ -357,6 +372,9 @@ class TARLManager:
         episode_reward = 0
         episode_length = 0
         episode_transitions = []
+        episode_loss = []
+        episode_entropy = []
+        episode_kl = []
 
         done = False
         while not done:
@@ -391,14 +409,44 @@ class TARLManager:
             episode_reward += reward
             episode_length += 1
 
+            if len(self.state_cache) >= self.k_low_entropy and self.adaptation_step % 10 == 0:
+                obs_batch = torch.FloatTensor(
+                    np.array(list(self.state_cache))
+                ).to(self.device)
+
+                filtered_obs = self._filter_low_entropy_samples(obs_batch)
+
+                if len(filtered_obs) > 0:
+                    loss_info = self._update(filtered_obs)
+                    episode_loss.append(loss_info['total_loss'])
+                    episode_entropy.append(loss_info['entropy'])
+                    episode_kl.append(loss_info['kl_div'])
+            
+            self.adaptation_step += 1
+
             if episode_length >= 1000:
                 break
+
+        if len(episode_loss) > 0:
+            avg_loss = np.mean(episode_loss)
+            avg_entropy = np.mean(episode_entropy)
+            avg_kl = np.mean(episode_kl)
+        else:
+            avg_loss = 0.0
+            avg_entropy = 0.0
+            avg_kl = 0.0
 
         return {
             'episode_reward': episode_reward,
             'episode_length': episode_length,
             'transitions': episode_transitions,
-            'adaptation_step': self.adaptation_step
+            'adaptation_step': self.adaptation_step,
+            'adaptation_loss': avg_loss,
+            'entropy': avg_entropy,
+            'kl_div': avg_kl,
+            'episode_loss': episode_loss,
+            'episode_entropy': episode_entropy,
+            'episode_kl': episode_kl
         }
 
     def run_adaptation(self, num_episodes: int = 10) -> Tuple[List[Dict], Dict[str, Any]]:
@@ -409,9 +457,9 @@ class TARLManager:
             num_episodes: Number of adaptation episodes
             
         Returns:
-            adaptation_data: List of episode data
-            summary: Summary statistics
-        """
+                adaptation_data: List of episode data
+                summary: Summary statistics
+            """
         adaptation_data = []
         loss_history = []
         entropy_history = []
@@ -421,24 +469,10 @@ class TARLManager:
             episode_data = self._run_single_episode()
             adaptation_data.append(episode_data)
 
-            if len(self.state_cache) >= self.k_low_entropy:
-                obs_batch = torch.FloatTensor(
-                    np.array(list(self.state_cache))
-                ).to(self.device)
-
-                filtered_obs = self._filter_low_entropy_samples(obs_batch)
-
-                if len(filtered_obs) > 0:
-                    loss_info = self._update(filtered_obs)
-                    loss_history.append(loss_info['total_loss'])
-                    entropy_history.append(loss_info['entropy'])
-                    kl_history.append(loss_info['kl_div'])
-
-                    episode_data['adaptation_loss'] = loss_info['total_loss']
-                    episode_data['entropy'] = loss_info['entropy']
-                    episode_data['kl_div'] = loss_info['kl_div']
-
-            self.adaptation_step += 1
+            if 'episode_loss' in episode_data and len(episode_data['episode_loss']) > 0:
+                loss_history.extend(episode_data['episode_loss'])
+                entropy_history.extend(episode_data['episode_entropy'])
+                kl_history.extend(episode_data['episode_kl'])
 
             tta_status = "TARL"
             print(f"Episode {episode + 1}/{num_episodes} ({tta_status}): "
@@ -517,7 +551,10 @@ class TARLManager:
             'trainable_params': len(self.trainable_params),
             'learning_rate': self.learning_rate,
             'kl_weight': self.kl_weight,
-            'k_low_entropy': self.k_low_entropy
+            'k_low_entropy': self.k_low_entropy,
+            'adaptation_mode': self.adaptation_mode,
+            'last_n_layers': self.last_n_layers,
+            'param_names': self.param_names[:5]
         }
 
     def save_checkpoint(self, save_path: str):
