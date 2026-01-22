@@ -67,9 +67,12 @@ class ModelLoader:
         else:
             return self._create_generic_policy(obs_dim, action_dim, action_space)
     
-    def _create_cql_policy(self, obs_dim: int, action_dim: int, action_space: gym.spaces.Space) -> BasePolicy:
+    def _create_cql_policy(self, obs_dim: int, action_dim: int, action_space: gym.spaces.Space,
+                          hidden_dims: list = None, use_layernorm_actor: bool = True) -> BasePolicy:
         """创建CQLPolicy实例"""
-        hidden_dims = [256, 256, 256]
+        if hidden_dims is None:
+            hidden_dims = [256, 256, 256]
+        
         actor_lr = 1e-4
         critic_lr = 3e-4
         gamma = 0.99
@@ -86,7 +89,7 @@ class ModelLoader:
         
         max_action = action_space.high[0]
         
-        actor_backbone = MLP(input_dim=obs_dim, hidden_dims=hidden_dims)
+        actor_backbone = MLP(input_dim=obs_dim, hidden_dims=hidden_dims, use_layernorm=use_layernorm_actor)
         critic1_backbone = MLP(input_dim=obs_dim + action_dim, hidden_dims=hidden_dims)
         critic2_backbone = MLP(input_dim=obs_dim + action_dim, hidden_dims=hidden_dims)
         
