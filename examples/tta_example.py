@@ -123,7 +123,8 @@ def run_tta_experiment(env_name: str, policy_checkpoint: str,
                        enable_tta: bool = True,
                        tta_strategy: str = 'entropy_minimization',
                        num_episodes: int = 20,
-                       results_csv_path: str = "./tta_results.csv"):
+                       results_csv_path: str = "./tta_results.csv",
+                       learning_rate: float = 1e-5):
     """
     运行TTA实验并保存结果到CSV
     
@@ -135,6 +136,7 @@ def run_tta_experiment(env_name: str, policy_checkpoint: str,
         tta_strategy: TTA策略 ('entropy_minimization' 或 'uncertainty_minimization')
         num_episodes: 评估回合数
         results_csv_path: CSV结果文件路径
+        learning_rate: TTA学习率
     """
     from offlinerlkit.tta.shifted_env import create_shifted_env
     from offlinerlkit.tta.tta_manager import TTAManager
@@ -168,7 +170,7 @@ def run_tta_experiment(env_name: str, policy_checkpoint: str,
             
             # 解冻参数以支持TTA训练
             if enable_tta and tta_strategy != 'none':
-                lr = 1e-5
+                lr = learning_rate
                 
                 if tta_strategy == 'entropy_minimization':
                     # 熵最小化：优化 actor 网络
@@ -190,7 +192,7 @@ def run_tta_experiment(env_name: str, policy_checkpoint: str,
             adaptation_config = {
                 'enable_tta': enable_tta,
                 'strategy': tta_strategy,
-                'learning_rate': 1e-5,
+                'learning_rate': learning_rate,
                 'batch_size': 32,
                 'collapse_threshold': -100.0,
                 'collapse_window': 5
@@ -879,6 +881,7 @@ if __name__ == "__main__":
     parser.add_argument("--episodes", type=int, default=20, help="Number of episodes per experiment")
     parser.add_argument("--output", type=str, default="./tta_results.csv", help="Output CSV file path for results")
     parser.add_argument("--shifts", type=str, nargs="+", default=["light_mass", "heavy_mass", "low_friction", "observation_noise"], help="List of shift configurations to test")
+    parser.add_argument("--learning_rate", type=float, default=1e-5, help="Learning rate for TTA adaptation")
 
     args = parser.parse_args()
 
@@ -890,6 +893,7 @@ if __name__ == "__main__":
     print(f"Episodes: {args.episodes}")
     print(f"TTA Enabled: {args.enable_tta}")
     print(f"TTA Strategy: {args.tta_strategy}")
+    print(f"Learning Rate: {args.learning_rate}")
     print(f"Output: {args.output}")
     print(f"Shifts: {args.shifts}")
 
@@ -936,7 +940,8 @@ if __name__ == "__main__":
                 enable_tta=args.enable_tta,
                 tta_strategy=args.tta_strategy,
                 num_episodes=args.episodes,
-                results_csv_path=args.output
+                results_csv_path=args.output,
+                learning_rate=args.learning_rate
             )
 
         print("\n" + "=" * 80)
