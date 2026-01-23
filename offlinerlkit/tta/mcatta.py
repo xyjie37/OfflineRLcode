@@ -8,75 +8,147 @@ from collections import deque
 from offlinerlkit.policy.base_policy import BasePolicy
 
 
-class PerformancePredictor(nn.Module):
+class EntropyDynamicsPredictor(nn.Module):
     """
-    Performance Predictor f_φ
+    Entropy Dynamics Predictor f_φ
     
-    Predicts performance trend based on policy smoothness and exploration breadth
-    without using explicit rewards.
+    Predicts entropy evolution as a conditional Gaussian distribution.
+    f_φ(S_t, H_t) = (μ_t, logσ_t²)
+    
+    Uses prediction error as uncertainty signal for OOD detection.
     """
 
-    def __init__(self, input_dim: int = 2, hidden_dim: int = 64, output_dim: int = 1):
+    def __init__(self, input_dim: int = 2, hidden_dim: int = 64):
         super().__init__()
         self.network = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, output_dim)
+            nn.Linear(hidden_dim, 2)
         )
 
-    def forward(self, smoothness: torch.Tensor, breadth: torch.Tensor) -> torch.Tensor:
+    def forward(self, smoothness: torch.Tensor, entropy: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
-            smoothness: Policy smoothness metric (gradient norm)
-            breadth: Exploration breadth metric (state feature variance)
+            smoothness: Policy smoothness metric S_t = ||∇_s π_θ_t||
+            entropy: Current policy entropy H_t
         
         Returns:
-            Predicted performance change
+            mu: Predicted mean of entropy change (Ḣ_t)
+            log_var: Log of predicted variance (for numerical stability)
         """
-        x = torch.cat([smoothness, breadth], dim=-1)
-        return self.network(x)
+        if smoothness.dim() == 0:
+            smoothness = smoothness.unsqueeze(0)
+        if entropy.dim() == 0:
+            entropy = entropy.unsqueeze(0)
+        
+        x = torch.cat([smoothness, entropy], dim=-1)
+        if x.dim() == 1:
+            x = x.unsqueeze(0)
+            
+        output = self.network(x)
+        
+        if output.dim() == 2:
+            mu = output[:, 0]
+            log_var = output[:, 1]
+        else:
+            mu = output[0]
+            log_var = output[1]
+            
+        log_var = torch.clamp(log_var, min=-5, max=2)
+        return mu.squeeze(-1), log_var.squeeze(-1)
 
 
-class PolicyCache:
+class EntropyDynamicsCache:
     """
-    Policy cache for storing recent policies and their associated metrics
+    Entropy Dynamics Cache D_H for storing (S_t, H_t, Ḣ_t) triplets.
+    
+    Used for:
+    - Computing entropy acceleration ẍ_t
+    - Training the entropy dynamics predictor
+    - OOD detection via prediction error
     """
 
-    def __init__(self, capacity: int = 10):
+    def __init__(self, capacity: int = 100):
         self.capacity = capacity
-        self.policies = deque(maxlen=capacity)
-        self.metrics = deque(maxlen=capacity)
-        self.performance_trends = deque(maxlen=capacity)
+        self.smoothness_history = deque(maxlen=capacity)
+        self.entropy_history = deque(maxlen=capacity)
+        self.entropy_rate_history = deque(maxlen=capacity)
+        self.uncertainty_history = deque(maxlen=capacity)
 
-    def add(self, policy_state: Dict[str, torch.Tensor], 
-            metrics: Dict[str, float], 
-            performance_trend: float):
-        """Add a policy to the cache"""
-        self.policies.append(policy_state)
-        self.metrics.append(metrics)
-        self.performance_trends.append(performance_trend)
+    def add(self, smoothness: float, entropy: float, entropy_rate: float, uncertainty: float = 0.0):
+        """Add entropy dynamics triplet to cache"""
+        self.smoothness_history.append(smoothness)
+        self.entropy_history.append(entropy)
+        self.entropy_rate_history.append(entropy_rate)
+        self.uncertainty_history.append(uncertainty)
 
-    def get_recent(self, k: int = 5) -> List[Tuple[Dict, Dict, float]]:
-        """Get k most recent policies"""
-        recent = list(zip(self.policies, self.metrics, self.performance_trends))
-        return recent[-k:]
+    def get_recent(self, k: int = 5) -> List[Tuple[float, float, float, float]]:
+        """Get k most recent entropy dynamics"""
+        n = len(self)
+        if n == 0:
+            return []
+        recent_k = min(k, n)
+        return [
+            (self.smoothness_history[-(i+1)], 
+             self.entropy_history[-(i+1)], 
+             self.entropy_rate_history[-(i+1)],
+             self.uncertainty_history[-(i+1)])
+            for i in range(recent_k)
+        ][::-1]
 
-    def get_performance_history(self) -> List[float]:
-        """Get history of performance trends"""
-        return list(self.performance_trends)
+    def compute_entropy_acceleration(self) -> float:
+        """
+        Compute entropy acceleration (curvature of entropy change)
+        
+        ẍ_t = ((H_t - H_{t-1}) - (H_{t-1} - H_{t-2})) / Δt²
+        
+        Δt is assumed to be 1 episode for simplicity.
+        """
+        if len(self.entropy_rate_history) < 2:
+            return 0.0
+        
+        H_t = self.entropy_history[-1] if len(self.entropy_history) > 0 else 0.0
+        H_t_1 = self.entropy_history[-2] if len(self.entropy_history) > 1 else 0.0
+        H_t_2 = self.entropy_history[-3] if len(self.entropy_history) > 2 else 0.0
+        
+        H_dot_t = H_t - H_t_1
+        H_dot_t_1 = H_t_1 - H_t_2
+        
+        entropy_acc = H_dot_t - H_dot_t_1
+        return entropy_acc
+
+    def get_uncertainty_statistics(self) -> Tuple[float, float]:
+        """Get mean and std of uncertainty history"""
+        if len(self.uncertainty_history) == 0:
+            return 0.0, 0.0
+        uncertainty_arr = np.array(self.uncertainty_history)
+        return float(np.mean(uncertainty_arr)), float(np.std(uncertainty_arr))
 
     def __len__(self):
-        return len(self.policies)
+        return min(len(self.smoothness_history), self.capacity)
+
+    def clear(self):
+        """Clear the cache"""
+        self.smoothness_history.clear()
+        self.entropy_history.clear()
+        self.entropy_rate_history.clear()
+        self.uncertainty_history.clear()
 
 
-class MCATTAManager:
+class EDMSAManager:
     """
-    Meta-Conservative Adaptive Test-Time Adaptation (MCATTA)
+    Entropy-based Drift-adaptive Meta-Learning for Soft Actor-Critic (EDMSA)
     
-    Implements risk-driven conservative adaptation where the conservatism parameter
-    λ is dynamically adjusted based on the reflexive impact of policy updates.
+    Algorithm for reward-free online adaptation using entropy as the only 
+    observable performance proxy.
+    
+    Key innovations:
+    1. Entropy acceleration ẍ_t for OOD detection
+    2. Uncertainty-driven λ evolution via prediction error
+    3. Adaptive learning rate for catastrophic drift prevention
+    4. LayerNorm-only parameter updates for stable adaptation
     """
 
     def __init__(
@@ -94,31 +166,52 @@ class MCATTAManager:
         self.lambda_min = self.config.get('lambda_min', 0.1)
         self.lambda_max = self.config.get('lambda_max', 10.0)
         self.lambda_init = self.config.get('lambda_init', 1.0)
-        self.lambda_lr = self.config.get('lambda_lr', 0.01)
+        self.lambda_equilibrium = self.config.get('lambda_equilibrium', self.lambda_min)
+        
         self.policy_lr = self.config.get('policy_lr', 1e-4)
         self.batch_size = self.config.get('batch_size', 32)
-        self.cache_capacity = self.config.get('cache_capacity', 10)
-
+        self.cache_capacity = self.config.get('cache_capacity', 100)
+        
+        self.momentum = self.config.get('momentum', 0.9)
+        self.damping_coef = self.config.get('damping_coef', 1.0)
+        self.eta_lambda = self.config.get('eta_lambda', 0.01)
+        self.gamma_dissipation = self.config.get('gamma_dissipation', 0.1)
+        
+        self.ood_threshold_std = self.config.get('ood_threshold_std', 2.0)
+        self.lr_decay_factor = self.config.get('lr_decay_factor', 0.5)
+        self.lr_recovery_steps = self.config.get('lr_recovery_steps', 10)
+        
+        self.adaptation_mode = self.config.get('adaptation_mode', 'layernorm')
+        self.last_n_layers = self.config.get('last_n_layers', 2)
+        
         self.lambda_t = self.lambda_init
-        self.previous_delta = 0.0
+        self.lambda_momentum = 0.0
 
-        self.policy_cache = PolicyCache(capacity=self.cache_capacity)
+        self.entropy_cache = EntropyDynamicsCache(capacity=self.cache_capacity)
 
-        self.performance_predictor = PerformancePredictor().to(self.device)
+        self.entropy_predictor = EntropyDynamicsPredictor().to(self.device)
         self.predictor_optimizer = torch.optim.Adam(
-            self.performance_predictor.parameters(),
+            self.entropy_predictor.parameters(),
             lr=self.config.get('predictor_lr', 1e-3)
         )
 
         self.experience_buffer = deque(maxlen=10000)
 
         self.initial_policy_state = self._save_policy_state()
+        self._create_offline_actor()
 
         self.adaptation_step = 0
+        self.current_policy_lr = self.policy_lr
+        self.lr_recovery_counter = 0
+        self.is_adapting_lr = False
+
+        self.entropy_history = []
+        self.uncertainty_history = []
 
         if hasattr(self.policy, 'actor'):
+            self._setup_trainable_params()
             self.policy_optimizer = torch.optim.Adam(
-                self.policy.actor.parameters(),
+                self.trainable_params,
                 lr=self.policy_lr
             )
 
@@ -140,6 +233,78 @@ class MCATTAManager:
             state[name] = param.data.clone().detach()
         return state
 
+    def _create_offline_actor(self):
+        """Create a frozen copy of the initial actor for KL divergence computation"""
+        import copy
+        self._offline_actor = copy.deepcopy(self.policy.actor)
+        for param in self._offline_actor.parameters():
+            param.requires_grad = False
+
+    def _setup_trainable_params(self):
+        """
+        Setup trainable parameters based on adaptation mode
+        
+        Modes:
+        - 'layernorm': Only update LayerNorm parameters (most stable)
+        - 'last_n_layers': Update last N layers (balanced)
+        - 'all': Update all parameters (most adaptive, least stable)
+        """
+        if self.adaptation_mode == 'all':
+            self.trainable_params = list(self.policy.actor.parameters())
+            return
+        
+        trainable_params = []
+        
+        if self.adaptation_mode == 'layernorm':
+            trainable_params = self._get_layernorm_params()
+            if len(trainable_params) == 0:
+                print("警告: 未找到LayerNorm参数，自动切换到last_n_layers模式")
+                self.adaptation_mode = 'last_n_layers'
+        
+        if self.adaptation_mode == 'last_n_layers':
+            trainable_params = self._get_last_n_layers_params()
+        
+        self.trainable_params = [param for _, param in trainable_params]
+
+    def _get_layernorm_params(self) -> List[Tuple[str, nn.Parameter]]:
+        """Extract LayerNorm parameters for trainable adaptation"""
+        trainable_params = []
+        
+        if not hasattr(self.policy, 'actor'):
+            return trainable_params
+        
+        for name, module in self.policy.actor.named_modules():
+            if isinstance(module, nn.LayerNorm):
+                for param_name, param in module.named_parameters():
+                    full_name = f"actor.{name}.{param_name}" if name else f"actor.{param_name}"
+                    if param.requires_grad:
+                        trainable_params.append((full_name, param))
+        return trainable_params
+
+    def _get_last_n_layers_params(self, n: int = None) -> List[Tuple[str, nn.Parameter]]:
+        """Get parameters from the last N layers of the actor network"""
+        if n is None:
+            n = self.last_n_layers
+        
+        trainable_params = []
+        
+        if not hasattr(self.policy, 'actor'):
+            return trainable_params
+        
+        actor_modules = list(self.policy.actor.modules())
+        num_modules = len(actor_modules)
+        
+        last_n_start = max(0, num_modules - n)
+        
+        for i, (name, module) in enumerate(self.policy.actor.named_modules()):
+            if i >= last_n_start:
+                for param_name, param in module.named_parameters():
+                    if param.requires_grad:
+                        full_name = f"actor.{name}.{param_name}" if name else f"actor.{param_name}"
+                        trainable_params.append((full_name, param))
+        
+        return trainable_params
+
     def _compute_policy_entropy(self, obs: torch.Tensor) -> torch.Tensor:
         """Compute policy entropy"""
         if hasattr(self.policy, 'actor'):
@@ -149,34 +314,29 @@ class MCATTAManager:
         return torch.tensor(0.0, device=self.device)
 
     def _compute_kl_divergence(self, obs: torch.Tensor) -> torch.Tensor:
-        """Compute KL divergence between current policy and initial policy"""
-        if not hasattr(self.policy, 'actor'):
+        """Compute KL divergence between current policy and frozen offline policy"""
+        if not hasattr(self.policy, 'actor') or not hasattr(self, '_offline_actor'):
             return torch.tensor(0.0, device=self.device)
 
         current_dist = self.policy.actor(obs)
         
         with torch.no_grad():
-            initial_actor = self._create_initial_actor()
-            initial_dist = initial_actor(obs)
+            initial_dist = self._offline_actor(obs)
         
         kl = torch.distributions.kl.kl_divergence(current_dist, initial_dist)
         return kl.mean()
 
-    def _create_initial_actor(self):
-        """Create a copy of the initial actor"""
-        # 创建actor的深拷贝，避免使用类类型创建实例
-        import copy
-        initial_actor = copy.deepcopy(self.policy.actor)
-        return initial_actor
-
     def _compute_policy_smoothness(self, obs: torch.Tensor) -> torch.Tensor:
         """
-        Compute policy smoothness: gradient norm of policy w.r.t. actions
+        Compute policy smoothness: gradient norm of policy w.r.t. states
         
-        Lower gradient norm -> more stable policy
+        S_t = E[||∇_s π_θ(a|s)||_2]
         """
         if not hasattr(self.policy, 'actor'):
             return torch.tensor(0.0, device=self.device)
+        
+        if obs.dim() == 1:
+            obs = obs.unsqueeze(0)
 
         obs = obs.requires_grad_(True)
         action_dist = self.policy.actor(obs)
@@ -191,129 +351,297 @@ class MCATTAManager:
             create_graph=True, retain_graph=True
         )[0]
         
+        if grad is None:
+            return torch.tensor(0.0, device=self.device)
+        
         smoothness = torch.norm(grad, dim=-1).mean()
         return smoothness
 
-    def _compute_exploration_breadth(self, obs: torch.Tensor) -> torch.Tensor:
+    def _compute_episode_entropy(self, obs_batch: torch.Tensor) -> float:
         """
-        Compute exploration breadth: variance of state-action features
+        Compute episode-averaged policy entropy
         
-        Higher variance -> more exploration
+        H_t = E_{s~τ_t}[H(π_θt(·|s))]
         """
-        if not hasattr(self.policy, 'actor'):
-            return torch.tensor(0.0, device=self.device)
+        entropy = self._compute_policy_entropy(obs_batch)
+        return entropy.detach().cpu().item()
 
-        with torch.no_grad():
-            action_dist = self.policy.actor(obs)
-            if hasattr(action_dist, 'mean'):
-                actions = action_dist.mean
-            else:
-                actions = action_dist.mode()[0]
-            
-            state_action_features = torch.cat([obs, actions], dim=-1)
-            breadth = torch.var(state_action_features, dim=0).mean()
-        
-        return breadth
-
-    def _predict_performance_change(
+    def _predict_entropy_dynamics(
         self, 
         smoothness: torch.Tensor, 
-        breadth: torch.Tensor
-    ) -> torch.Tensor:
-        """Predict performance change using the performance predictor"""
-        return self.performance_predictor(smoothness, breadth)
+        entropy: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Predict entropy change using the entropy dynamics predictor
+        
+        f_φ(S_t, H_t) = (μ_t, logσ_t²)
+        
+        Returns:
+            mu: Predicted mean of entropy change (Ḣ_t)
+            log_var: Log variance for uncertainty estimation
+        """
+        mu, log_var = self.entropy_predictor(smoothness, entropy)
+        return mu, log_var
 
-    def _update_performance_predictor(
+    def _compute_prediction_uncertainty(
+        self, 
+        predicted_mu: float, 
+        predicted_log_var: float, 
+        actual_entropy_rate: float
+    ) -> float:
+        """
+        Compute prediction uncertainty as negative log-likelihood
+        
+        U_t = (Ḣ_t - μ_t)² / (2σ_t²) + 0.5·log(2πσ_t²)
+        
+        This is the NLL of the true entropy dynamics under the predicted distribution.
+        """
+        var = np.exp(np.clip(predicted_log_var, -5, 2))
+        nll = (actual_entropy_rate - predicted_mu) ** 2 / (2 * var) + 0.5 * np.log(2 * np.pi * var)
+        return float(nll)
+
+    def _train_predictor_maximum_likelihood(
         self, 
         smoothness: torch.Tensor, 
-        breadth: torch.Tensor, 
-        target_delta: float
-    ):
-        """Update the performance predictor using unsupervised signals"""
+        entropy: torch.Tensor, 
+        entropy_rate: torch.Tensor
+    ) -> float:
+        """
+        Train the entropy dynamics predictor with maximum likelihood
+        
+        L_φ^t = -log p_φ(Ḣ_t | S_t, H_t) = U_t
+        
+        The loss is exactly the uncertainty (NLL), so we minimize uncertainty.
+        """
         self.predictor_optimizer.zero_grad()
         
-        predicted_delta = self._predict_performance_change(smoothness, breadth)
+        mu, log_var = self.entropy_predictor(smoothness, entropy)
         
-        target = torch.tensor([[target_delta]], device=self.device)
-        loss = F.mse_loss(predicted_delta, target)
+        if mu.dim() == 0:
+            mu = mu.unsqueeze(0)
+            log_var = log_var.unsqueeze(0)
+            entropy_rate = entropy_rate.unsqueeze(0) if entropy_rate.dim() == 0 else entropy_rate
+        
+        var = torch.exp(torch.clamp(log_var, min=-5, max=2))
+        nll = 0.5 * torch.log(2 * np.pi * var) + 0.5 * (entropy_rate - mu) ** 2 / var
+        loss = nll.mean()
         
         loss.backward()
         self.predictor_optimizer.step()
         
         return loss.item()
 
-    def _update_lambda(self, predicted_delta: float):
+    def _outer_loop_lambda_evolution(self, uncertainty: float) -> Dict[str, float]:
         """
-        Update the conservatism parameter λ based on predicted performance change
+        Outer loop: λ evolution via gradient flow dynamics
         
-        If predicted improvement, decrease λ (more exploration)
-        If predicted degradation, increase λ (more conservative)
+        dλ/dt = η_λ·U_t - γ·(λ_t - λ_min)
+        
+        Discrete: λ_{t+1} = λ_t + Δt·[η_λ·U_t - γ·(λ_t - λ_min)]
+        
+        Returns:
+            Dict containing evolution metrics
         """
-        delta_change = predicted_delta - self.previous_delta
-        self.previous_delta = predicted_delta
+        delta_lambda = self.eta_lambda * uncertainty - self.gamma_dissipation * (self.lambda_t - self.lambda_equilibrium)
         
-        lambda_update = -self.lambda_lr * np.sign(delta_change)
-        self.lambda_t += lambda_update
+        self.lambda_momentum = self.momentum * self.lambda_momentum + delta_lambda
+        self.lambda_t = self.lambda_t + self.lambda_momentum
         self.lambda_t = np.clip(self.lambda_t, self.lambda_min, self.lambda_max)
-
-    def _inner_loop_update(self, obs_batch: torch.Tensor) -> torch.Tensor:
-        """
-        Inner loop: Policy update with adaptive conservatism
         
-        Loss = Entropy + λ * KL_Divergence
+        return {
+            'delta_lambda': delta_lambda,
+            'lambda_momentum': self.lambda_momentum
+        }
+
+    def _check_ood_and_adapt_lr(self, uncertainty: float) -> bool:
+        """
+        Check for OOD and adapt learning rate accordingly
+        
+        If U_t > E[U] + 2σ_U, trigger OOD and reduce learning rate.
+        
+        Returns:
+            True if OOD detected and lr adapted
+        """
+        mean_u, std_u = self.entropy_cache.get_uncertainty_statistics()
+        
+        if mean_u > 0 and std_u > 0:
+            threshold = mean_u + self.ood_threshold_std * std_u
+            if uncertainty > threshold:
+                self.current_policy_lr = self.policy_lr * self.lr_decay_factor
+                self.lr_recovery_counter = self.lr_recovery_steps
+                self.is_adapting_lr = True
+                return True
+        
+        if self.is_adapting_lr:
+            self.lr_recovery_counter -= 1
+            if self.lr_recovery_counter <= 0:
+                self.current_policy_lr = self.policy_lr
+                self.is_adapting_lr = False
+        
+        return False
+
+    def _load_policy_state(self, policy_state: Dict[str, torch.Tensor]):
+        """Load policy state from saved state dict"""
+        with torch.no_grad():
+            for name, param in policy_state.items():
+                if hasattr(self.policy, name):
+                    target = getattr(self.policy, name)
+                    if isinstance(target, nn.Parameter):
+                        target.data.copy_(param)
+                    elif hasattr(target, 'data'):
+                        target.data.copy_(param)
+
+    def _inner_loop_update(self, obs_batch: torch.Tensor) -> Tuple[torch.Tensor, float]:
+        """
+        Inner loop: Policy update with entropy-regularized KL control
+        
+        L_π^t(θ) = -H_t + (λ_t + β·|ẍ_t|)·D_KL^t
+        
+        where:
+        - H_t = E[H(π_θt(·|s))] is the policy entropy
+        - D_KL^t = E[D_KL(π_θt || π_θ0)] is the KL divergence from anchor
+        - λ_t is the conservatism coefficient
+        - β is the damping coefficient
+        - ẍ_t is the entropy acceleration
+        
+        Returns:
+            loss: The computed loss tensor
+            entropy_acc: The entropy acceleration used for damping
         """
         entropy = self._compute_policy_entropy(obs_batch)
         kl_div = self._compute_kl_divergence(obs_batch)
         
+        entropy_acc = self.entropy_cache.compute_entropy_acceleration()
+        damping = self.damping_coef * abs(entropy_acc)
+        
         lambda_tensor = torch.tensor(self.lambda_t, device=self.device)
-        loss = -entropy + lambda_tensor * kl_div
+        loss = -entropy + (lambda_tensor + damping) * kl_div
         
-        return loss
+        return loss, entropy_acc
 
-    def _outer_loop_update(self, obs_batch: torch.Tensor):
+    def _outer_loop_update(self) -> Dict[str, Any]:
         """
-        Outer loop: Conservatism parameter update
+        Outer loop: Entropy dynamics prediction and λ evolution
         
-        Uses performance prediction to adjust λ
+        1. Compute meta-features (S_t, H_t)
+        2. Predict entropy change Ḣ_t using f_φ
+        3. Compute prediction uncertainty U_t (NLL)
+        4. Update λ via gradient flow dynamics
+        5. Train predictor with maximum likelihood
+        
+        Returns:
+            Dict containing all metrics for this update
         """
+        if len(self.experience_buffer) < self.batch_size:
+            return {
+                'smoothness': 0.0,
+                'entropy': 0.0,
+                'entropy_rate': 0.0,
+                'predicted_mu': 0.0,
+                'predicted_log_var': 0.0,
+                'uncertainty': 0.0,
+                'lambda': self.lambda_t,
+                'entropy_acceleration': 0.0,
+                'predictor_loss': 0.0
+            }
+        
+        obs_batch = self._sample_batch()
+        if obs_batch is None:
+            return {
+                'smoothness': 0.0,
+                'entropy': 0.0,
+                'entropy_rate': 0.0,
+                'predicted_mu': 0.0,
+                'predicted_log_var': 0.0,
+                'uncertainty': 0.0,
+                'lambda': self.lambda_t,
+                'entropy_acceleration': 0.0,
+                'predictor_loss': 0.0
+            }
+        
         smoothness = self._compute_policy_smoothness(obs_batch)
-        breadth = self._compute_exploration_breadth(obs_batch)
+        entropy = self._compute_policy_entropy(obs_batch)
         
         smoothness_scalar = smoothness.detach().cpu().item()
-        breadth_scalar = breadth.detach().cpu().item()
+        entropy_scalar = entropy.detach().cpu().item()
         
-        predicted_delta = self._predict_performance_change(
+        if len(self.entropy_history) > 0:
+            prev_entropy = self.entropy_history[-1]
+            entropy_rate = entropy_scalar - prev_entropy
+        else:
+            entropy_rate = 0.0
+        
+        predicted_mu, predicted_log_var = self._predict_entropy_dynamics(
             smoothness.unsqueeze(0),
-            breadth.unsqueeze(0)
-        ).item()
+            entropy.unsqueeze(0)
+        )
         
-        self._update_lambda(predicted_delta)
+        predicted_mu_scalar = predicted_mu.item()
+        predicted_log_var_scalar = predicted_log_var.item()
+        
+        uncertainty = self._compute_prediction_uncertainty(
+            predicted_mu_scalar,
+            predicted_log_var_scalar,
+            entropy_rate
+        )
+        
+        self._outer_loop_lambda_evolution(uncertainty)
+        
+        self.entropy_cache.add(smoothness_scalar, entropy_scalar, entropy_rate, uncertainty)
+        
+        predictor_loss = self._train_predictor_maximum_likelihood(
+            smoothness.unsqueeze(0),
+            entropy.unsqueeze(0),
+            torch.tensor(entropy_rate, device=self.device)
+        )
+        
+        self.entropy_history.append(entropy_scalar)
+        self.uncertainty_history.append(uncertainty)
+        
+        entropy_acc = self.entropy_cache.compute_entropy_acceleration()
         
         return {
             'smoothness': smoothness_scalar,
-            'breadth': breadth_scalar,
-            'predicted_delta': predicted_delta,
-            'lambda': self.lambda_t
+            'entropy': entropy_scalar,
+            'entropy_rate': entropy_rate,
+            'predicted_mu': predicted_mu_scalar,
+            'predicted_log_var': predicted_log_var_scalar,
+            'uncertainty': uncertainty,
+            'lambda': self.lambda_t,
+            'entropy_acceleration': entropy_acc,
+            'predictor_loss': predictor_loss
         }
 
-    def _sample_batch(self, batch_size: Optional[int] = None) -> torch.Tensor:
+    def _sample_batch(self, batch_size: Optional[int] = None) -> Optional[torch.Tensor]:
         """Sample a batch from experience buffer"""
         batch_size = batch_size or self.batch_size
         
         if len(self.experience_buffer) < batch_size:
             return None
         
-        indices = np.random.choice(len(self.experience_buffer), batch_size, replace=False)
+        sample_size = min(len(self.experience_buffer), batch_size)
+        if sample_size == 0:
+            return None
+        
+        indices = np.random.choice(len(self.experience_buffer), sample_size, replace=False)
         batch = [self.experience_buffer[i] for i in indices]
         
-        obs_data = np.array([t['obs'] for t in batch])
-        obs_batch = torch.FloatTensor(obs_data).to(self.device)
-        
-        return obs_batch
+        try:
+            obs_data = np.array([t['obs'] for t in batch])
+            obs_batch = torch.FloatTensor(obs_data).to(self.device)
+            return obs_batch
+        except Exception as e:
+            return None
 
     def run_adaptation(self, num_episodes: int = 10) -> Tuple[List[Dict], Dict[str, Any]]:
         """
-        Run MCATTA adaptation
+        Run EDMSA adaptation (Entropy-based Drift-adaptive Meta-Learning)
+        
+        Algorithm:
+        1. Online interaction and data collection
+        2. Inner loop: Entropy-regularized policy improvement with acceleration damping
+        3. Outer loop: Uncertainty-driven λ evolution
+        4. Adaptive learning rate for OOD detection
         
         Args:
             num_episodes: Number of adaptation episodes
@@ -324,56 +652,77 @@ class MCATTAManager:
         """
         adaptation_data = []
         lambda_history = []
-        performance_history = []
+        uncertainty_history = []
+        entropy_history = []
+        entropy_acc_history = []
+        ood_detected_count = 0
         
         for episode in range(num_episodes):
             episode_data = self._run_single_episode()
             adaptation_data.append(episode_data)
             
-            obs_batch = self._sample_batch()
-            if obs_batch is not None:
-                outer_metrics = self._outer_loop_update(obs_batch)
-                
-                self.policy_optimizer.zero_grad()
-                loss = self._inner_loop_update(obs_batch)
-                loss.backward()
-                self.policy_optimizer.step()
-                
-                episode_data.update({
-                    'lambda': outer_metrics['lambda'],
-                    'smoothness': outer_metrics['smoothness'],
-                    'breadth': outer_metrics['breadth'],
-                    'predicted_delta': outer_metrics['predicted_delta'],
-                    'adaptation_loss': loss.item()
-                })
-                
-                lambda_history.append(outer_metrics['lambda'])
-                performance_history.append(outer_metrics['predicted_delta'])
-                
-                policy_state = self._save_policy_state()
-                self.policy_cache.add(
-                    policy_state,
-                    {
-                        'smoothness': outer_metrics['smoothness'],
-                        'breadth': outer_metrics['breadth']
-                    },
-                    outer_metrics['predicted_delta']
-                )
+            outer_metrics = self._outer_loop_update()
+            
+            if hasattr(self.policy, 'actor') and hasattr(self, 'policy_optimizer'):
+                obs_batch = self._sample_batch()
+                if obs_batch is not None:
+                    self.policy_optimizer.zero_grad()
+                    loss, entropy_acc = self._inner_loop_update(obs_batch)
+                    loss.backward()
+                    
+                    for param_group in self.policy_optimizer.param_groups:
+                        param_group['lr'] = self.current_policy_lr
+                    
+                    self.policy_optimizer.step()
+                    
+                    episode_data['adaptation_loss'] = loss.item()
+                    episode_data['entropy_acceleration'] = entropy_acc
+            
+            ood_detected = self._check_ood_and_adapt_lr(outer_metrics['uncertainty'])
+            if ood_detected:
+                ood_detected_count += 1
+                episode_data['ood_detected'] = True
+            
+            episode_data.update({
+                'lambda': outer_metrics['lambda'],
+                'smoothness': outer_metrics['smoothness'],
+                'entropy': outer_metrics['entropy'],
+                'entropy_rate': outer_metrics['entropy_rate'],
+                'predicted_mu': outer_metrics['predicted_mu'],
+                'predicted_log_var': outer_metrics['predicted_log_var'],
+                'uncertainty': outer_metrics['uncertainty'],
+                'predictor_loss': outer_metrics['predictor_loss'],
+                'current_lr': self.current_policy_lr,
+                'lr_adapting': self.is_adapting_lr
+            })
+            
+            lambda_history.append(outer_metrics['lambda'])
+            uncertainty_history.append(outer_metrics['uncertainty'])
+            entropy_history.append(outer_metrics['entropy'])
+            entropy_acc_history.append(outer_metrics['entropy_acceleration'])
             
             self.adaptation_step += 1
             
+            lr_status = f", LR: {self.current_policy_lr:.2e}" if self.is_adapting_lr else ""
             print(f"Episode {episode + 1}/{num_episodes}: "
                   f"Reward: {episode_data['episode_reward']:.2f}, "
+                  f"Entropy: {outer_metrics['entropy']:.3f}, "
                   f"Lambda: {self.lambda_t:.3f}, "
-                  f"Predicted Delta: {episode_data.get('predicted_delta', 0):.4f}")
+                  f"Uncertainty: {outer_metrics['uncertainty']:.4f}, "
+                  f"OOD: {'Yes' if ood_detected else 'No'}{lr_status}")
         
         summary = {
             'final_lambda': self.lambda_t,
             'lambda_history': lambda_history,
-            'performance_history': performance_history,
+            'uncertainty_history': uncertainty_history,
+            'entropy_history': entropy_history,
+            'entropy_acceleration_history': entropy_acc_history,
             'mean_reward': np.mean([d['episode_reward'] for d in adaptation_data]),
             'std_reward': np.std([d['episode_reward'] for d in adaptation_data]),
-            'cache_size': len(self.policy_cache)
+            'final_uncertainty': uncertainty_history[-1] if uncertainty_history else 0.0,
+            'final_entropy': entropy_history[-1] if entropy_history else 0.0,
+            'ood_detected_count': ood_detected_count,
+            'final_lr': self.current_policy_lr
         }
         
         return adaptation_data, summary
@@ -470,26 +819,32 @@ class MCATTAManager:
         }
 
     def save_checkpoint(self, save_path: str):
-        """Save MCATTA checkpoint"""
+        """Save EDMSA checkpoint"""
         checkpoint = {
             'policy_state_dict': self.policy.state_dict(),
             'lambda_t': self.lambda_t,
+            'lambda_momentum': self.lambda_momentum,
             'adaptation_step': self.adaptation_step,
-            'performance_predictor_state_dict': self.performance_predictor.state_dict(),
+            'entropy_predictor_state_dict': self.entropy_predictor.state_dict(),
             'policy_optimizer_state_dict': self.policy_optimizer.state_dict(),
             'predictor_optimizer_state_dict': self.predictor_optimizer.state_dict(),
+            'entropy_history': self.entropy_history,
+            'uncertainty_history': self.uncertainty_history,
             'config': self.config
         }
         torch.save(checkpoint, save_path)
 
     def load_checkpoint(self, checkpoint_path: str):
-        """Load MCATTA checkpoint"""
+        """Load EDMSA checkpoint"""
         checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
         
         self.policy.load_state_dict(checkpoint['policy_state_dict'])
         self.lambda_t = checkpoint['lambda_t']
+        self.lambda_momentum = checkpoint.get('lambda_momentum', 0.0)
         self.adaptation_step = checkpoint['adaptation_step']
-        self.performance_predictor.load_state_dict(checkpoint['performance_predictor_state_dict'])
+        self.entropy_predictor.load_state_dict(checkpoint['entropy_predictor_state_dict'])
         self.policy_optimizer.load_state_dict(checkpoint['policy_optimizer_state_dict'])
         self.predictor_optimizer.load_state_dict(checkpoint['predictor_optimizer_state_dict'])
+        self.entropy_history = checkpoint.get('entropy_history', [])
+        self.uncertainty_history = checkpoint.get('uncertainty_history', [])
         self.config = checkpoint.get('config', {})
