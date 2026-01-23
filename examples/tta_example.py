@@ -12,7 +12,7 @@ import csv
 import os
 from typing import Dict, Any, List
 
-from offlinerlkit.tta import ShiftedPolicyEvaluator, run_tta_evaluation, MCATTAManager, TARLManager
+from offlinerlkit.tta import ShiftedPolicyEvaluator, run_tta_evaluation, EDMSAManager, TARLManager
 from offlinerlkit.policy import CQLPolicy
 
 
@@ -362,14 +362,15 @@ def print_comparison_summary(results: List[Dict]):
 def run_mcatta_experiment(env_name: str, policy_checkpoint: str,
                           shift_configs: Dict[str, Any],
                           num_episodes: int = 20,
-                          results_csv_path: str = "./mcatta_results.csv"):
+                          results_csv_path: str = "./edmsa_results.csv"):
     """
-    运行MCATTA实验并保存结果到CSV
+    运行EDMSA实验并保存结果到CSV
     
-    MCATTA (Meta-Conservative Adaptive Test-Time Adaptation) 特点：
-    - 自适应保守度参数 λ
-    - 基于性能预测动态调整保守性
-    - 无需显式奖励信号
+    EDMSA (Entropy-based Drift-adaptive Meta-Learning) 特点：
+    - 基于熵作为唯一性能代理
+    - 熵加速度 ẍ_t 用于 OOD 检测
+    - 不确定性驱动的 λ 演化
+    - 自适应学习率防止灾难性漂移
     
     Args:
         env_name: 环境名称
@@ -383,7 +384,7 @@ def run_mcatta_experiment(env_name: str, policy_checkpoint: str,
     
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"Using device: {device}")
-    print("Running MCATTA (Meta-Conservative Adaptive TTA)...")
+    print("Running EDMSA (Entropy-based Drift-adaptive Meta-Learning)...")
     
     all_results = []
     
@@ -406,37 +407,50 @@ def run_mcatta_experiment(env_name: str, policy_checkpoint: str,
             }
             policy = model_loader.load_pretrained_model(policy_checkpoint, env_config)
             
-            mcatta_config = {
+            edmsa_config = {
                 'lambda_min': 0.1,
                 'lambda_max': 10.0,
                 'lambda_init': 1.0,
-                'lambda_lr': 0.01,
-                'policy_lr': 1e-4,
+                'lambda_equilibrium': 0.1,
+                'policy_lr': 5e-5,
                 'batch_size': 32,
-                'cache_capacity': 10,
+                'cache_capacity': 100,
+                'momentum': 0.9,
+                'damping_coef': 1.0,
+                'eta_lambda': 0.01,
+                'gamma_dissipation': 0.1,
+                'ood_threshold_std': 2.0,
+                'lr_decay_factor': 0.5,
+                'lr_recovery_steps': 10,
+                'adaptation_mode': 'last_n_layers',
+                'last_n_layers': 2,
                 'predictor_lr': 1e-3
             }
             
-            mcatta_manager = MCATTAManager(policy, env, mcatta_config)
-            adaptation_data, summary = mcatta_manager.run_adaptation(num_episodes=num_episodes)
+            edmsa_manager = EDMSAManager(policy, env, edmsa_config)
+            adaptation_data, summary = edmsa_manager.run_adaptation(num_episodes=num_episodes)
             
             result_row = {
                 'shift_name': shift_name,
                 'seed': seed,
-                'algorithm': 'MCATTA',
+                'algorithm': 'EDMSA',
                 'mean_reward': summary.get('mean_reward', 0),
                 'std_reward': summary.get('std_reward', 0),
                 'final_lambda': summary.get('final_lambda', 0),
-                'cache_size': summary.get('cache_size', 0),
+                'final_entropy': summary.get('final_entropy', 0),
+                'final_uncertainty': summary.get('final_uncertainty', 0),
+                'ood_detected_count': summary.get('ood_detected_count', 0),
                 'lambda_history_mean': np.mean(summary.get('lambda_history', [0])),
                 'lambda_history_std': np.std(summary.get('lambda_history', [0])),
-                'performance_history_mean': np.mean(summary.get('performance_history', [0])),
-                'performance_history_std': np.std(summary.get('performance_history', [0]))
+                'uncertainty_history_mean': np.mean(summary.get('uncertainty_history', [0])),
+                'uncertainty_history_std': np.std(summary.get('uncertainty_history', [0]))
             }
             all_results.append(result_row)
             
             print(f"  Seed {seed}: Reward = {result_row['mean_reward']:.2f} ± {result_row['std_reward']:.2f}, "
-                  f"Final λ = {result_row['final_lambda']:.3f}")
+                  f"Final λ = {result_row['final_lambda']:.3f}, "
+                  f"Final Entropy = {result_row['final_entropy']:.3f}, "
+                  f"OOD Detections = {result_row['ood_detected_count']}")
     
     save_mcatta_results_to_csv(all_results, results_csv_path)
     
@@ -554,12 +568,13 @@ def save_tarl_results_to_csv(results: List[Dict], csv_path: str):
 
 
 def save_mcatta_results_to_csv(results: List[Dict], csv_path: str):
-    """保存MCATTA结果到CSV文件"""
+    """保存EDMSA结果到CSV文件"""
     os.makedirs(os.path.dirname(csv_path) if os.path.dirname(csv_path) else '.', exist_ok=True)
     
     fieldnames = ['shift_name', 'seed', 'algorithm', 'mean_reward', 'std_reward',
-                  'final_lambda', 'cache_size', 'lambda_history_mean', 'lambda_history_std',
-                  'performance_history_mean', 'performance_history_std']
+                  'final_lambda', 'final_entropy', 'final_uncertainty', 'ood_detected_count',
+                  'lambda_history_mean', 'lambda_history_std',
+                  'uncertainty_history_mean', 'uncertainty_history_std']
     
     formatted_results = []
     for row in results:
@@ -576,7 +591,7 @@ def save_mcatta_results_to_csv(results: List[Dict], csv_path: str):
         writer.writeheader()
         writer.writerows(formatted_results)
     
-    print(f"\nMCATTA results saved to: {csv_path}")
+    print(f"\nEDMSA results saved to: {csv_path}")
 
 
 def compare_tta_strategies(env_name: str, policy_checkpoint: str,
@@ -590,7 +605,7 @@ def compare_tta_strategies(env_name: str, policy_checkpoint: str,
     - 无TTA (No TTA)
     - 熵最小化 (Entropy Minimization)
     - 不确定性最小化 (Uncertainty Minimization)
-    - MCATTA (Meta-Conservative Adaptive TTA)
+    - EDMSA (Entropy-based Drift-adaptive Meta-Learning)
     
     Args:
         env_name: 环境名称
@@ -644,19 +659,19 @@ def compare_tta_strategies(env_name: str, policy_checkpoint: str,
         all_results.extend(results)
     
     print(f"\n{'='*60}")
-    print("Testing: MCATTA")
+    print("Testing: EDMSA (Entropy-based Drift-adaptive Meta-Learning)")
     print(f"{'='*60}")
     
-    mcatta_csv_path = os.path.join(results_dir, "MCATTA.csv")
-    mcatta_results = run_mcatta_experiment(
+    edmsa_csv_path = os.path.join(results_dir, "EDMSA.csv")
+    edmsa_results = run_mcatta_experiment(
         env_name=env_name,
         policy_checkpoint=policy_checkpoint,
         shift_configs=shift_configs,
         num_episodes=num_episodes,
-        results_csv_path=mcatta_csv_path
+        results_csv_path=edmsa_csv_path
     )
     
-    all_results.extend(mcatta_results)
+    all_results.extend(edmsa_results)
     
     print(f"\n{'='*60}")
     print("Testing: TARL")
@@ -693,8 +708,8 @@ def generate_comparison_summary(results: List[Dict]) -> Dict[str, Any]:
                         if r['shift_name'] == shift_name)
         
         for algo in algorithms:
-            if algo == 'MCATTA':
-                subset = [r for r in results if r['shift_name'] == shift_name and r.get('algorithm') == 'MCATTA']
+            if algo == 'EDMSA':
+                subset = [r for r in results if r['shift_name'] == shift_name and r.get('algorithm') == 'EDMSA']
             elif algo == 'TARL':
                 subset = [r for r in results if r['shift_name'] == shift_name and r.get('algorithm') == 'TARL']
             else:
@@ -749,9 +764,9 @@ def print_comparison_summary_table(summary: Dict[str, Any]):
 
 
 def mcatta_demo():
-    """MCATTA演示函数"""
+    """EDMSA演示函数"""
     print("=" * 80)
-    print("MCATTA (Meta-Conservative Adaptive TTA) Demo")
+    print("EDMSA (Entropy-based Drift-adaptive Meta-Learning) Demo")
     print("=" * 80)
     
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -766,22 +781,22 @@ def mcatta_demo():
     }
     
     try:
-        print("\nRunning MCATTA Experiment...")
+        print("\nRunning EDMSA Experiment...")
         results = run_mcatta_experiment(
             env_name="hopper-medium-v2",
             policy_checkpoint="./checkpoints/cql_hopper_medium.pt",
             shift_configs=shift_configs,
             num_episodes=20,
-            results_csv_path="./mcatta_results.csv"
+            results_csv_path="./edmsa_results.csv"
         )
         
         print("\n" + "=" * 80)
-        print("MCATTA experiment completed successfully!")
-        print("Results saved to: ./mcatta_results.csv")
+        print("EDMSA experiment completed successfully!")
+        print("Results saved to: ./edmsa_results.csv")
         print("=" * 80)
         
     except Exception as e:
-        print(f"Error running MCATTA experiment: {e}")
+        print(f"Error running EDMSA experiment: {e}")
         print("Make sure you have the required checkpoints and dependencies.")
 
 
@@ -837,13 +852,13 @@ def main():
             results_csv_path="./tta_results_no_tta.csv"
         )
         
-        print("\n4. Running MCATTA Experiment...")
-        results_mcatta = run_mcatta_experiment(
+        print("\n4. Running EDMSA Experiment...")
+        results_edmsa = run_mcatta_experiment(
             env_name="hopper-medium-v2",
             policy_checkpoint="./checkpoints/cql_hopper_medium.pt",
             shift_configs=shift_configs,
             num_episodes=20,
-            results_csv_path="./mcatta_results.csv"
+            results_csv_path="./edmsa_results.csv"
         )
         
         print("\n5. Running TARL Experiment...")
@@ -861,7 +876,7 @@ def main():
         print("  - ./tta_results_entropy.csv")
         print("  - ./tta_results_uncertainty.csv")
         print("  - ./tta_results_no_tta.csv")
-        print("  - ./mcatta_results.csv")
+        print("  - ./edmsa_results.csv")
         print("  - ./tarl_results.csv")
         print("=" * 80)
         
@@ -875,7 +890,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="OfflineRL-Kit TTA Framework CLI")
     parser.add_argument("--enable_tta", action="store_true", help="Enable Test-Time Adaptation (TTA)")
-    parser.add_argument("--tta_strategy", type=str, choices=["entropy_minimization", "uncertainty_minimization", "mcatta", "tarl", "none"], default="entropy_minimization", help="TTA strategy to use")
+    parser.add_argument("--tta_strategy", type=str, choices=["entropy_minimization", "uncertainty_minimization", "edmsa", "tarl", "none"], default="entropy_minimization", help="TTA strategy to use")
     parser.add_argument("--env", type=str, default="hopper-medium-v2", help="Environment name (e.g., hopper-medium-v2)")
     parser.add_argument("--checkpoint", type=str, default="./checkpoints/cql_hopper_medium.pt", help="Path to policy checkpoint file")
     parser.add_argument("--episodes", type=int, default=20, help="Number of episodes per experiment")
@@ -913,8 +928,8 @@ if __name__ == "__main__":
     print(f"Using device: {device}")
 
     try:
-        if args.tta_strategy == "mcatta":
-            print(f"\nRunning MCATTA Experiment...")
+        if args.tta_strategy == "edmsa":
+            print(f"\nRunning EDMSA Experiment...")
             results = run_mcatta_experiment(
                 env_name=args.env,
                 policy_checkpoint=args.checkpoint,
