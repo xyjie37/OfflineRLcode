@@ -164,8 +164,9 @@ class MCATTAManager:
 
     def _create_initial_actor(self):
         """Create a copy of the initial actor"""
-        initial_actor = type(self.policy.actor).to(self.device)
-        initial_actor.load_state_dict(self.initial_policy_state)
+        # 创建actor的深拷贝，避免使用类类型创建实例
+        import copy
+        initial_actor = copy.deepcopy(self.policy.actor)
         return initial_actor
 
     def _compute_policy_smoothness(self, obs: torch.Tensor) -> torch.Tensor:
