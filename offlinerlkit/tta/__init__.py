@@ -9,7 +9,7 @@ from offlinerlkit.tta.shifted_env import ShiftedMujocoEnvWrapper
 from offlinerlkit.tta.model_loader import ModelLoader
 from offlinerlkit.tta.tta_manager import TTAManager
 from offlinerlkit.tta.evaluator import ShiftedPolicyEvaluator, run_tta_evaluation
-from offlinerlkit.tta.mcatta import EDMSAManager, EntropyDynamicsPredictor, EntropyDynamicsCache
+from offlinerlkit.tta.mcatta import CCEAManager, ContrastiveCache
 from offlinerlkit.tta.tarl import TARLManager
 
 __all__ = [
@@ -18,8 +18,7 @@ __all__ = [
     "TTAManager",
     "ShiftedPolicyEvaluator",
     "run_tta_evaluation",
-    "EDMSAManager",
-    "EntropyDynamicsPredictor",
-    "EntropyDynamicsCache",
+    "CCEAManager",
+    "ContrastiveCache",
     "TARLManager"
 ]
