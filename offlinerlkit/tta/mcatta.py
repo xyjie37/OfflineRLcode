@@ -120,8 +120,8 @@ class CCEAManager:
         self.v_min = self.config.get('v_min', 0.1)
         
         self.warmup_episodes = self.config.get('warmup_episodes', 5)
-        self.step_update_interval = self.config.get('step_update_interval', 10)
-        self.step_lambda_momentum = self.config.get('step_lambda_momentum', 0.3)
+        self.step_update_interval = self.config.get('step_update_interval', 50)
+        self.step_lambda_momentum = self.config.get('step_lambda_momentum', 0.1)
         self.step_novelty_set_size = self.config.get('step_novelty_set_size', 50)
         self.inner_loop_step_interval = self.config.get('inner_loop_step_interval', 30)
         
@@ -291,10 +291,13 @@ class CCEAManager:
         Returns:
             y_t: Episode quality label ∈ {+1, -1, 0}
         """
+        # Adaptive novelty threshold: use max(0.5, mean of recent 10 novelty values)
+        adaptive_v_min = max(0.5, np.mean(self.novelty_history[-10:]) if len(self.novelty_history) >= 10 else 0.5)
+        
         if (self.entropy_low <= H_t <= self.entropy_high and 
             abs(ΔH_t) < self.delta_stable):
             return 1
-        elif H_t > self.entropy_high or V_t < self.v_min:
+        elif H_t > self.entropy_high or V_t < adaptive_v_min:
             return -1
         else:
             return 0
@@ -336,10 +339,16 @@ class CCEAManager:
         Run warm-up episodes to dynamically initialize entropy thresholds
         
         Uses offline policy to collect entropy statistics for 5 episodes
+        Implements per-episode adaptive threshold updates:
+        - After every 3 episodes, update thresholds using recent 5 episodes
+        - entropy_high = 75th percentile of recent entropies
+        - entropy_low = 25th percentile of recent entropies
+        - Initial entropy_high = max(warmup_mean + std, 0.15)
         """
         print("Running warm-up to initialize dynamic thresholds...")
         
         warmup_entropies = []
+        episode_count = 0
         
         for _ in range(self.warmup_episodes):
             reset_result = self.env.reset()
@@ -374,20 +383,32 @@ class CCEAManager:
                     break
             
             if episode_count > 0:
-                warmup_entropies.append(episode_entropy / episode_count)
+                avg_entropy = episode_entropy / episode_count
+                warmup_entropies.append(avg_entropy)
+                episode_count += 1
+                
+                # Per-episode adaptive threshold update: every 3 episodes
+                if episode_count % 3 == 0 and len(warmup_entropies) >= 5:
+                    recent_entropies = warmup_entropies[-5:]
+                    self.entropy_low = np.percentile(recent_entropies, 25)
+                    self.entropy_high = np.percentile(recent_entropies, 75)
+                    print(f"  Episode {episode_count}: Updated thresholds using recent 5 episodes")
+                    print(f"    Recent entropies: {[f'{e:.4f}' for e in recent_entropies]}")
+                    print(f"    Updated: low={self.entropy_low:.4f}, high={self.entropy_high:.4f}")
         
         if len(warmup_entropies) > 0:
             entropy_mean = np.mean(warmup_entropies)
             entropy_std = np.std(warmup_entropies)
             
+            # Set initial entropy_high to max(warmup_mean + std, 0.15)
+            self.entropy_high = max(entropy_mean + entropy_std, 0.15)
             self.entropy_low = max(0.05, entropy_mean - 3.0 * entropy_std)
-            self.entropy_high = entropy_mean + 3.0 * entropy_std
             self.delta_stable = max(0.05, entropy_std)
             
             print(f"Warm-up completed:")
             print(f"  Entropy mean: {entropy_mean:.4f}")
             print(f"  Entropy std: {entropy_std:.4f}")
-            print(f"  Dynamic thresholds: low={self.entropy_low:.4f}, high={self.entropy_high:.4f}, stable={self.delta_stable:.4f}")
+            print(f"  Final thresholds: low={self.entropy_low:.4f}, high={self.entropy_high:.4f}, stable={self.delta_stable:.4f}")
         
         self.warmup_completed = True
 
@@ -474,9 +495,10 @@ class CCEAManager:
         """
         Update lambda via step-level EMA dynamics (Fast Path)
         
-        λ_new = 0.7 * λ_old + 0.3 * [λ_min + (λ_max - λ_min) * U_cont]
+        λ_new = (1 - momentum) * λ_old + momentum * [λ_min + (λ_max - λ_min) * U_cont]
         
         No entropy suppression term in step-level updates to avoid high-frequency oscillation
+        Removed max_drift logic to allow proper lambda adaptation
         
         Args:
             U_cont: Step-level contrastive uncertainty
@@ -488,12 +510,8 @@ class CCEAManager:
         lambda_target = self.lambda_min + (self.lambda_max - self.lambda_min) * U_cont
         lambda_new = (1.0 - self.step_lambda_momentum) * self.step_lambda_ema + self.step_lambda_momentum * lambda_target
         
-        # Clip to bounds
+        # Clip to hard bounds only
         lambda_new = np.clip(lambda_new, self.lambda_min, self.lambda_max)
-        
-        # Limit drift within episode (max 2x change)
-        max_drift = max(self.lambda_min, abs(self.step_lambda_ema) * 2)
-        lambda_new = np.clip(lambda_new, self.lambda_min, max_drift)
         
         self.step_lambda_ema = lambda_new
         return lambda_new
@@ -665,6 +683,13 @@ class CCEAManager:
         
         # Synchronize lambda from step-level EMA
         self.lambda_t = self.step_lambda_ema
+        
+        # Episode-level lambda recalibration (compensation mechanism)
+        # Use episode-level U_cont to recalibrate lambda for better adaptation
+        episode_U_cont = self._compute_contrastive_uncertainty_fast(meta_features)
+        self.lambda_t = (1.0 - 0.3) * self.lambda_t + 0.3 * (self.lambda_min + (self.lambda_max - self.lambda_min) * episode_U_cont)
+        self.lambda_t = np.clip(self.lambda_t, self.lambda_min, self.lambda_max)
+        self.step_lambda_ema = self.lambda_t  # Sync step_ema to prevent drift
         
         # Update history
         self.entropy_history.append(H_t)
