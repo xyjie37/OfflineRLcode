@@ -852,13 +852,10 @@ class CCEAManager:
 
     def _run_single_episode_with_updates(self) -> Dict[str, Any]:
         """
-        Run a single episode with Fast-Slow dual-scale updates
+        Run a single episode with episode-level updates only
         
-        Fast Path (every 10 steps):
-        - Aggregate step metrics
-        - Compute contrastive uncertainty
-        - Update lambda via EMA
-        - Inner loop policy update (every 30 steps)
+        Step-level Fast Path has been removed to avoid dynamics conflict.
+        Lambda is now updated only at episode level via _outer_loop_update_episode.
         
         Returns:
             episode_data: Dictionary containing episode information
@@ -923,27 +920,8 @@ class CCEAManager:
             if len(self.step_novelty_set) > self.step_novelty_set_size:
                 self.step_novelty_set.pop()
             
-            # Fast Path: Step-level updates (every 10 steps)
-            if step_count % self.step_update_interval == 0 and len(self.step_buffer) >= 5:
-                # Aggregate step metrics
-                step_metrics = self._aggregate_step_metrics()
-                meta_features = [step_metrics['H_t'], step_metrics['ΔH_t'], step_metrics['S_t'], step_metrics['V_t']]
-                
-                # Compute contrastive uncertainty (cold-start supported)
-                U_cont = self._compute_contrastive_uncertainty_fast(meta_features)
-                
-                # Update lambda via EMA smoothing
-                lambda_new = self._update_lambda_step(U_cont, step_metrics['H_t'])
-                
-                # Inner loop policy update (every 30 steps)
-                if step_count % self.inner_loop_step_interval == 0:
-                    if hasattr(self.policy, 'actor') and hasattr(self, 'policy_optimizer'):
-                        obs_batch = self._sample_batch()
-                        if obs_batch is not None:
-                            self.policy_optimizer.zero_grad()
-                            loss = self._inner_loop_update(obs_batch)
-                            loss.backward()
-                            self.policy_optimizer.step()
+            # Fast Path removed to avoid dynamics conflict between step-level and episode-level lambda updates
+            # Lambda is now updated only at episode level for stability
             
             obs = next_obs
             
