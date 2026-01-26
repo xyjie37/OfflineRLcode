@@ -12,7 +12,7 @@ import csv
 import os
 from typing import Dict, Any, List
 
-from offlinerlkit.tta import ShiftedPolicyEvaluator, run_tta_evaluation, CCEAManager, TARLManager
+from offlinerlkit.tta import ShiftedPolicyEvaluator, run_tta_evaluation, CCEAManager, TARLManager, STINTManager
 from offlinerlkit.policy import CQLPolicy
 
 
@@ -203,6 +203,8 @@ def run_tta_experiment(env_name: str, policy_checkpoint: str,
             
             result_row = {
                 'shift_name': shift_name,
+                'shift_label': shift_config.get('shift_label', 'unknown'),
+                'mass_scale': shift_config.get('mass_scale', 1.0),
                 'seed': seed,
                 'enable_tta': enable_tta,
                 'tta_strategy': tta_strategy,
@@ -229,7 +231,7 @@ def save_results_to_csv(results: List[Dict], csv_path: str):
     """保存结果到CSV文件"""
     os.makedirs(os.path.dirname(csv_path) if os.path.dirname(csv_path) else '.', exist_ok=True)
     
-    fieldnames = ['shift_name', 'seed', 'enable_tta', 'tta_strategy', 
+    fieldnames = ['shift_name', 'shift_label', 'mass_scale', 'seed', 'enable_tta', 'tta_strategy', 
                   'mean_reward', 'std_reward', 'max_reward', 'min_reward',
                   'worst_case_return', 'mean_length', 'mean_policy_divergence',
                   'collapse_detected', 'collapse_rate']
@@ -302,7 +304,7 @@ def run_comparison_experiment(env_name: str, policy_checkpoint: str,
 
 def save_summary_to_csv(results: List[Dict], csv_path: str):
     """保存汇总结果到CSV"""
-    fieldnames = ['shift_name', 'enable_tta', 'tta_strategy', 
+    fieldnames = ['shift_name', 'shift_label', 'mass_scale', 'enable_tta', 'tta_strategy', 
                   'mean_reward', 'std_reward', 'worst_case_return', 
                   'mean_policy_divergence', 'collapse_rate']
     
@@ -316,6 +318,8 @@ def save_summary_to_csv(results: List[Dict], csv_path: str):
                 if subset:
                     summary_data.append({
                         'shift_name': shift_name,
+                        'shift_label': subset[0].get('shift_label', 'unknown'),
+                        'mass_scale': subset[0].get('mass_scale', 1.0),
                         'enable_tta': enable_tta,
                         'tta_strategy': strategy,
                         'mean_reward': np.mean([r['mean_reward'] for r in subset]),
@@ -432,6 +436,8 @@ def run_ccea_experiment(env_name: str, policy_checkpoint: str,
             
             result_row = {
                 'shift_name': shift_name,
+                'shift_label': shift_config.get('shift_label', 'unknown'),
+                'mass_scale': shift_config.get('mass_scale', 1.0),
                 'seed': seed,
                 'algorithm': 'CCEA',
                 'mean_reward': summary.get('mean_reward', 0),
@@ -519,6 +525,8 @@ def run_tarl_experiment(env_name: str, policy_checkpoint: str,
             
             result_row = {
                 'shift_name': shift_name,
+                'shift_label': shift_config.get('shift_label', 'unknown'),
+                'mass_scale': shift_config.get('mass_scale', 1.0),
                 'seed': seed,
                 'algorithm': 'TARL',
                 'mean_reward': summary.get('mean_reward', 0),
@@ -546,7 +554,7 @@ def save_tarl_results_to_csv(results: List[Dict], csv_path: str):
     """保存TARL结果到CSV文件"""
     os.makedirs(os.path.dirname(csv_path) if os.path.dirname(csv_path) else '.', exist_ok=True)
     
-    fieldnames = ['shift_name', 'seed', 'algorithm', 'mean_reward', 'std_reward',
+    fieldnames = ['shift_name', 'shift_label', 'mass_scale', 'seed', 'algorithm', 'mean_reward', 'std_reward',
                   'mean_length', 'mean_loss', 'mean_entropy', 'mean_kl',
                   'cache_size', 'adaptation_steps']
     
@@ -568,11 +576,126 @@ def save_tarl_results_to_csv(results: List[Dict], csv_path: str):
     print(f"\nTARL results saved to: {csv_path}")
 
 
+def run_stint_experiment(env_name: str, policy_checkpoint: str,
+                        shift_configs: Dict[str, Any],
+                        num_episodes: int = 20,
+                        results_csv_path: str = "./stint_results.csv"):
+    """
+    运行STINT实验并保存结果到CSV
+    
+    STINT (Stability-Triggered Intervention for Test-Time RL Adaptation) 特点：
+    - 组件A: 熵突增触发器 (Entropy surge trigger)
+    - 组件B: 参考策略信任域 (Reference policy trust region)
+    - 组件C: 参数节流 (Parameter throttling)
+    
+    Args:
+        env_name: 环境名称
+        policy_checkpoint: 策略检查点路径
+        shift_configs: shift配置字典
+        num_episodes: 评估回合数
+        results_csv_path: CSV结果文件路径
+    """
+    from offlinerlkit.tta.shifted_env import create_shifted_env
+    from offlinerlkit.tta.model_loader import ModelLoader
+    
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print(f"Using device: {device}")
+    print("Running STINT (Stability-Triggered Intervention for Test-Time RL Adaptation)...")
+    
+    all_results = []
+    
+    for shift_name, shift_config in shift_configs.items():
+        print(f"\nTesting shift: {shift_name}")
+        print(f"Shift config: {shift_config}")
+        
+        for seed in range(3):
+            np.random.seed(seed)
+            torch.manual_seed(seed)
+            
+            env = create_shifted_env(env_name, shift_config)
+            
+            model_loader = ModelLoader(CQLPolicy, device=device)
+            env_config = {
+                'observation_space': env.observation_space,
+                'action_space': env.action_space,
+                'obs_dim': env.observation_space.shape[0],
+                'action_dim': env.action_space.shape[0]
+            }
+            policy = model_loader.load_pretrained_model(policy_checkpoint, env_config)
+            
+            stint_config = {
+                'delta': 0.5,
+                'lambda_kl': 1.0,
+                'K': 3,
+                'beta': 0.1,
+                'learning_rate': 1e-4,
+                'adaptation_mode': 'layernorm'
+            }
+            
+            stint_manager = STINTManager(policy, env, stint_config)
+            adaptation_data, summary = stint_manager.run_adaptation(num_episodes=num_episodes)
+            
+            result_row = {
+                'shift_name': shift_name,
+                'shift_label': shift_config.get('shift_label', 'unknown'),
+                'mass_scale': shift_config.get('mass_scale', 1.0),
+                'seed': seed,
+                'algorithm': 'STINT',
+                'mean_reward': summary.get('mean_reward', 0),
+                'std_reward': summary.get('std_reward', 0),
+                'mean_length': summary.get('mean_length', 0),
+                'mean_loss': summary.get('mean_loss', 0),
+                'mean_entropy': summary.get('mean_entropy', 0),
+                'mean_kl': summary.get('mean_kl', 0),
+                'total_triggers': summary.get('total_triggers', 0),
+                'mean_triggers_per_episode': summary.get('mean_triggers_per_episode', 0),
+                'adaptation_steps': summary.get('adaptation_steps', 0),
+                'final_entropy_moving_avg': summary.get('final_entropy_moving_avg', 0)
+            }
+            all_results.append(result_row)
+            
+            print(f"  Seed {seed}: Reward = {result_row['mean_reward']:.2f} ± {result_row['std_reward']:.2f}, "
+                  f"Loss = {result_row['mean_loss']:.6f}, "
+                  f"Entropy = {result_row['mean_entropy']:.4f}, "
+                  f"KL = {result_row['mean_kl']:.4f}, "
+                  f"Triggers = {result_row['total_triggers']}")
+    
+    save_stint_results_to_csv(all_results, results_csv_path)
+    
+    return all_results
+
+
+def save_stint_results_to_csv(results: List[Dict], csv_path: str):
+    """保存STINT结果到CSV文件"""
+    os.makedirs(os.path.dirname(csv_path) if os.path.dirname(csv_path) else '.', exist_ok=True)
+    
+    fieldnames = ['shift_name', 'shift_label', 'mass_scale', 'seed', 'algorithm', 'mean_reward', 'std_reward',
+                  'mean_length', 'mean_loss', 'mean_entropy', 'mean_kl',
+                  'total_triggers', 'mean_triggers_per_episode', 'adaptation_steps', 'final_entropy_moving_avg']
+    
+    formatted_results = []
+    for row in results:
+        formatted_row = {}
+        for key, value in row.items():
+            if isinstance(value, float):
+                formatted_row[key] = round(value, 6)
+            else:
+                formatted_row[key] = value
+        formatted_results.append(formatted_row)
+    
+    with open(csv_path, 'w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(formatted_results)
+    
+    print(f"\nSTINT results saved to: {csv_path}")
+
+
 def save_ccea_results_to_csv(results: List[Dict], csv_path: str):
     """保存CCEA结果到CSV文件"""
     os.makedirs(os.path.dirname(csv_path) if os.path.dirname(csv_path) else '.', exist_ok=True)
     
-    fieldnames = ['shift_name', 'seed', 'algorithm', 
+    fieldnames = ['shift_name', 'shift_label', 'mass_scale', 'seed', 'algorithm', 
                   'mean_reward', 'std_reward', 'final_lambda',
                   'final_entropy', 'final_entropy_velocity', 'final_contrastive_uncertainty',
                   'lambda_history_mean', 'lambda_history_std',
@@ -687,6 +810,21 @@ def compare_tta_strategies(env_name: str, policy_checkpoint: str,
     
     all_results.extend(tarl_results)
     
+    print(f"\n{'='*60}")
+    print("Testing: STINT")
+    print(f"{'='*60}")
+    
+    stint_csv_path = os.path.join(results_dir, "STINT.csv")
+    stint_results = run_stint_experiment(
+        env_name=env_name,
+        policy_checkpoint=policy_checkpoint,
+        shift_configs=shift_configs,
+        num_episodes=num_episodes,
+        results_csv_path=stint_csv_path
+    )
+    
+    all_results.extend(stint_results)
+    
     comparison_summary = generate_comparison_summary(all_results)
     summary_csv = os.path.join(results_dir, "comparison_summary.csv")
     save_comparison_summary_to_csv(comparison_summary, summary_csv)
@@ -711,6 +849,8 @@ def generate_comparison_summary(results: List[Dict]) -> Dict[str, Any]:
                 subset = [r for r in results if r['shift_name'] == shift_name and r.get('algorithm') == 'CCEA']
             elif algo == 'TARL':
                 subset = [r for r in results if r['shift_name'] == shift_name and r.get('algorithm') == 'TARL']
+            elif algo == 'STINT':
+                subset = [r for r in results if r['shift_name'] == shift_name and r.get('algorithm') == 'STINT']
             else:
                 subset = [r for r in results if r['shift_name'] == shift_name and r.get('tta_strategy') == algo]
             
@@ -869,6 +1009,15 @@ def main():
             results_csv_path="./tarl_results.csv"
         )
         
+        print("\n6. Running STINT Experiment...")
+        results_stint = run_stint_experiment(
+            env_name="hopper-medium-v2",
+            policy_checkpoint="./checkpoints/cql_hopper_medium.pt",
+            shift_configs=shift_configs,
+            num_episodes=20,
+            results_csv_path="./stint_results.csv"
+        )
+        
         print("\n" + "=" * 80)
         print("All experiments completed successfully!")
         print("Results saved to CSV files:")
@@ -877,6 +1026,7 @@ def main():
         print("  - ./tta_results_no_tta.csv")
         print("  - ./ccea_results.csv")
         print("  - ./tarl_results.csv")
+        print("  - ./stint_results.csv")
         print("=" * 80)
         
     except Exception as e:
@@ -889,7 +1039,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="OfflineRL-Kit TTA Framework CLI")
     parser.add_argument("--enable_tta", action="store_true", help="Enable Test-Time Adaptation (TTA)")
-    parser.add_argument("--tta_strategy", type=str, choices=["entropy_minimization", "uncertainty_minimization", "ccea", "tarl", "none"], default="entropy_minimization", help="TTA strategy to use")
+    parser.add_argument("--tta_strategy", type=str, choices=["entropy_minimization", "uncertainty_minimization", "ccea", "tarl", "stint", "none"], default="entropy_minimization", help="TTA strategy to use")
     parser.add_argument("--env", type=str, default="hopper-medium-v2", help="Environment name (e.g., hopper-medium-v2)")
     parser.add_argument("--checkpoint", type=str, default="./checkpoints/cql_hopper_medium.pt", help="Path to policy checkpoint file")
     parser.add_argument("--episodes", type=int, default=20, help="Number of episodes per experiment")
