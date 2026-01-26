@@ -11,6 +11,7 @@ from offlinerlkit.tta.tta_manager import TTAManager
 from offlinerlkit.tta.evaluator import ShiftedPolicyEvaluator, run_tta_evaluation
 from offlinerlkit.tta.mcatta import CCEAManager, ContrastiveCache
 from offlinerlkit.tta.tarl import TARLManager
+from offlinerlkit.tta.stint import STINTManager
 
 __all__ = [
     "ShiftedMujocoEnvWrapper",
@@ -20,5 +21,6 @@ __all__ = [
     "run_tta_evaluation",
     "CCEAManager",
     "ContrastiveCache",
-    "TARLManager"
+    "TARLManager",
+    "STINTManager"
 ]
