@@ -33,14 +33,6 @@ class ContrastiveCache:
         """Add to negative cache with entropy-priority replacement"""
         self.neg_cache.append((meta_features, entropy))
 
-    def get_pos_entries(self) -> List[Tuple[List[float], float]]:
-        """Get all positive cache entries"""
-        return list(self.pos_cache)
-
-    def get_neg_entries(self) -> List[Tuple[List[float], float]]:
-        """Get all negative cache entries"""
-        return list(self.neg_cache)
-
     def compute_contrastive_distance(self, query_features: List[float]) -> Tuple[float, float]:
         """
         Compute contrastive distances to positive and negative caches
@@ -65,9 +57,6 @@ class ContrastiveCache:
             d_neg = float(np.min(distances))
         
         return d_pos, d_neg
-
-    def __len__(self):
-        return len(self.pos_cache) + len(self.neg_cache)
 
     def clear(self):
         """Clear both caches"""
@@ -120,10 +109,7 @@ class CCEAManager:
         self.v_min = self.config.get('v_min', 0.1)
         
         self.warmup_episodes = self.config.get('warmup_episodes', 5)
-        self.step_update_interval = self.config.get('step_update_interval', 50)
-        self.step_lambda_momentum = self.config.get('step_lambda_momentum', 0.1)
-        self.step_novelty_set_size = self.config.get('step_novelty_set_size', 50)
-        self.inner_loop_step_interval = self.config.get('inner_loop_step_interval', 30)
+        self.last_n_layers = self.config.get('last_n_layers', 2)  # 修复：添加缺失的配置
         
         self.adaptation_mode = self.config.get('adaptation_mode', 'layernorm')
         
@@ -137,7 +123,6 @@ class CCEAManager:
 
         self.experience_buffer = deque(maxlen=10000)
 
-        self.initial_policy_state = self._save_policy_state()
         self._create_offline_actor()
 
         self.adaptation_step = 0
@@ -149,10 +134,6 @@ class CCEAManager:
         self.contrastive_uncertainty_history = []
 
         self.warmup_completed = False
-        self.step_buffer = deque(maxlen=50)
-        self.step_entropy_window = deque(maxlen=20)
-        self.step_novelty_set = set()
-        self.current_episode_transitions = []
 
         if hasattr(self.policy, 'actor'):
             self._setup_trainable_params()
@@ -171,13 +152,6 @@ class CCEAManager:
             return next(self.policy.parameters()).device
         else:
             return torch.device('cpu')
-
-    def _save_policy_state(self) -> Dict[str, torch.Tensor]:
-        """Save current policy state"""
-        state = {}
-        for name, param in self.policy.named_parameters():
-            state[name] = param.data.clone().detach()
-        return state
 
     def _create_offline_actor(self):
         """Create a frozen copy of the initial actor for KL divergence computation"""
@@ -275,179 +249,7 @@ class CCEAManager:
         novelty_ratio = len(unique_states) / len(episode_transitions)
         return novelty_ratio
 
-    def _compute_episode_quality_label(self, H_t: float, ΔH_t: float, V_t: float) -> int:
-        """
-        Compute episode quality label y_t
-        
-        y_t = +1 if H_t ∈ [H_low, H_high] and |ΔH_t| < δ_stable (high quality)
-        y_t = -1 if H_t > H_high or V_t < v_min (low quality)
-        y_t = 0 otherwise (neutral)
-        
-        Args:
-            H_t: Current episode entropy
-            ΔH_t: Entropy velocity
-            V_t: State novelty ratio
-            
-        Returns:
-            y_t: Episode quality label ∈ {+1, -1, 0}
-        """
-        # Adaptive novelty threshold: use max(0.5, mean of recent 10 novelty values)
-        adaptive_v_min = max(0.5, np.mean(self.novelty_history[-10:]) if len(self.novelty_history) >= 10 else 0.5)
-        
-        if (self.entropy_low <= H_t <= self.entropy_high and 
-            abs(ΔH_t) < self.delta_stable):
-            return 1
-        elif H_t > self.entropy_high or V_t < adaptive_v_min:
-            return -1
-        else:
-            return 0
-
     def _compute_contrastive_uncertainty(self, meta_features: List[float]) -> float:
-        """
-        Compute contrastive uncertainty U_t^cont
-        
-        U_t^cont = σ((d_pos - d_neg) / τ)
-        
-        where:
-        - d_pos = min distance to positive cache
-        - d_neg = min distance to negative cache
-        - σ is sigmoid function
-        - τ is temperature parameter
-        
-        Args:
-            meta_features: 4D meta-feature vector [H_t, ΔH_t, S_t, V_t]
-            
-        Returns:
-            U_t^cont: Contrastive uncertainty ∈ (0, 1)
-        """
-        d_pos, d_neg = self.contrastive_cache.compute_contrastive_distance(meta_features)
-        
-        if d_pos == float('inf') and d_neg == float('inf'):
-            return 0.5
-        
-        if d_pos == float('inf'):
-            return 0.9
-        
-        if d_neg == float('inf'):
-            return 0.1
-        
-        U_cont = 1.0 / (1.0 + np.exp(-(d_pos - d_neg) / self.tau))
-        return U_cont
-
-    def _warmup_thresholds(self):
-        """
-        Run warm-up episodes to dynamically initialize entropy thresholds
-        
-        Uses offline policy to collect entropy statistics for 5 episodes
-        Implements per-episode adaptive threshold updates:
-        - After every 3 episodes, update thresholds using recent 5 episodes
-        - entropy_high = 75th percentile of recent entropies
-        - entropy_low = 25th percentile of recent entropies
-        - Initial entropy_high = max(warmup_mean + std, 0.15)
-        """
-        print("Running warm-up to initialize dynamic thresholds...")
-        
-        warmup_entropies = []
-        episode_count = 0
-        
-        for _ in range(self.warmup_episodes):
-            reset_result = self.env.reset()
-            if isinstance(reset_result, tuple):
-                obs, _ = reset_result
-            else:
-                obs = reset_result
-            
-            episode_entropy = 0.0
-            episode_count = 0
-            
-            done = False
-            while not done:
-                with torch.no_grad():
-                    action = self.policy.select_action(obs)
-                
-                step_result = self.env.step(action)
-                if len(step_result) == 5:
-                    next_obs, reward, terminated, truncated, info = step_result
-                    done = terminated or truncated
-                else:
-                    next_obs, reward, done, info = step_result
-                
-                obs_batch = torch.FloatTensor(obs).unsqueeze(0).to(self.device)
-                entropy = self._compute_policy_entropy(obs_batch)
-                episode_entropy += entropy.detach().cpu().item()
-                episode_count += 1
-                
-                obs = next_obs
-                
-                if episode_count >= 1000:
-                    break
-            
-            if episode_count > 0:
-                avg_entropy = episode_entropy / episode_count
-                warmup_entropies.append(avg_entropy)
-                episode_count += 1
-                
-                # Per-episode adaptive threshold update: every 3 episodes
-                if episode_count % 3 == 0 and len(warmup_entropies) >= 5:
-                    recent_entropies = warmup_entropies[-5:]
-                    self.entropy_low = np.percentile(recent_entropies, 25)
-                    self.entropy_high = np.percentile(recent_entropies, 75)
-                    print(f"  Episode {episode_count}: Updated thresholds using recent 5 episodes")
-                    print(f"    Recent entropies: {[f'{e:.4f}' for e in recent_entropies]}")
-                    print(f"    Updated: low={self.entropy_low:.4f}, high={self.entropy_high:.4f}")
-        
-        if len(warmup_entropies) > 0:
-            entropy_mean = np.mean(warmup_entropies)
-            entropy_std = np.std(warmup_entropies)
-            
-            # Set initial entropy_high to max(warmup_mean + std, 0.15)
-            self.entropy_high = max(entropy_mean + entropy_std, 0.15)
-            self.entropy_low = max(0.05, entropy_mean - 3.0 * entropy_std)
-            self.delta_stable = max(0.05, entropy_std)
-            
-            print(f"Warm-up completed:")
-            print(f"  Entropy mean: {entropy_mean:.4f}")
-            print(f"  Entropy std: {entropy_std:.4f}")
-            print(f"  Final thresholds: low={self.entropy_low:.4f}, high={self.entropy_high:.4f}, stable={self.delta_stable:.4f}")
-        
-        self.warmup_completed = True
-
-    def _aggregate_step_metrics(self) -> Dict[str, float]:
-        """
-        Aggregate step-level metrics for fast path uncertainty computation
-        
-        Returns:
-            Dict containing H_t, ΔH_t, S_t, V_t
-        """
-        if len(self.step_buffer) == 0:
-            return {'H_t': 0.0, 'ΔH_t': 0.0, 'S_t': 0.0, 'V_t': 0.0}
-        
-        # H_t: Exponential moving average of recent 5 steps
-        recent_entropies = [t['entropy'] for t in list(self.step_buffer)[-5:]]
-        H_t = np.mean(recent_entropies) if recent_entropies else 0.0
-        
-        # ΔH_t: Linear regression slope from step_entropy_window (20 steps)
-        if len(self.step_entropy_window) >= 5:
-            x = np.arange(len(self.step_entropy_window))
-            y = np.array(list(self.step_entropy_window))
-            if np.std(x) > 1e-6:
-                slope = np.polyfit(x, y, 1)[0]
-                ΔH_t = slope * len(self.step_entropy_window)
-            else:
-                ΔH_t = 0.0
-        else:
-            ΔH_t = 0.0
-        
-        # V_t: Novelty ratio from step_novelty_set
-        V_t = len(self.step_novelty_set) / self.step_novelty_set_size
-        
-        # S_t: Mean gradient norm from step_buffer
-        smoothness_values = [t.get('smoothness', 0.0) for t in self.step_buffer]
-        S_t = np.mean(smoothness_values) if smoothness_values else 0.0
-        
-        return {'H_t': H_t, 'ΔH_t': ΔH_t, 'S_t': S_t, 'V_t': V_t}
-
-    def _compute_contrastive_uncertainty_fast(self, meta_features: List[float]) -> float:
         """
         Compute contrastive uncertainty with cold-start fallback
         
@@ -472,8 +274,9 @@ class CCEAManager:
             return U_cont
         
         # Normal mode: use contrastive distance with adaptive tau
-        if len(self.step_entropy_window) >= 5:
-            adaptive_tau = max(0.1, np.std(list(self.step_entropy_window)))
+        if len(self.entropy_history) >= 5:
+            recent_entropies = self.entropy_history[-5:]
+            adaptive_tau = max(0.1, np.std(recent_entropies))
         else:
             adaptive_tau = self.tau
         
@@ -491,30 +294,81 @@ class CCEAManager:
         U_cont = 1.0 / (1.0 + np.exp(-(d_pos - d_neg) / adaptive_tau))
         return U_cont
 
-    def _update_lambda_step(self, U_cont: float, H_t: float) -> float:
+    def _warmup_thresholds(self):
         """
-        Update lambda via step-level EMA dynamics (Fast Path)
+        Run warm-up episodes to dynamically initialize entropy thresholds
         
-        λ_new = (1 - momentum) * λ_old + momentum * [λ_min + (λ_max - λ_min) * U_cont]
+        Uses offline policy to collect entropy statistics for 5 episodes
+        Implements per-episode adaptive threshold updates:
+        - After every 3 episodes, update thresholds using recent 5 episodes
+        - entropy_high = 75th percentile of recent entropies
+        - entropy_low = 25th percentile of recent entropies
+        - Initial entropy_high = max(warmup_mean + std, 0.15)
+        """
+        print("Running warm-up to initialize dynamic thresholds...")
         
-        No entropy suppression term in step-level updates to avoid high-frequency oscillation
-        Removed max_drift logic to allow proper lambda adaptation
+        warmup_entropies = []
         
-        Args:
-            U_cont: Step-level contrastive uncertainty
-            H_t: Current entropy
+        for episode_idx in range(self.warmup_episodes):
+            reset_result = self.env.reset()
+            if isinstance(reset_result, tuple):
+                obs, _ = reset_result
+            else:
+                obs = reset_result
             
-        Returns:
-            Updated lambda value
-        """
-        lambda_target = self.lambda_min + (self.lambda_max - self.lambda_min) * U_cont
-        lambda_new = (1.0 - self.step_lambda_momentum) * self.step_lambda_ema + self.step_lambda_momentum * lambda_target
+            episode_entropy = 0.0
+            step_count = 0  # 修复：使用独立变量名避免覆盖
+            
+            done = False
+            while not done:
+                with torch.no_grad():
+                    action = self.policy.select_action(obs)
+                
+                step_result = self.env.step(action)
+                if len(step_result) == 5:
+                    next_obs, reward, terminated, truncated, info = step_result
+                    done = terminated or truncated
+                else:
+                    next_obs, reward, done, info = step_result
+                
+                obs_batch = torch.FloatTensor(obs).unsqueeze(0).to(self.device)
+                entropy = self._compute_policy_entropy(obs_batch)
+                episode_entropy += entropy.detach().cpu().item()
+                step_count += 1
+                
+                obs = next_obs
+                
+                if step_count >= 1000:
+                    break
+            
+            if step_count > 0:
+                avg_entropy = episode_entropy / step_count
+                warmup_entropies.append(avg_entropy)
+                
+                # Per-episode adaptive threshold update: every 3 episodes
+                if (episode_idx + 1) % 3 == 0 and len(warmup_entropies) >= 5:
+                    recent_entropies = warmup_entropies[-5:]
+                    self.entropy_low = np.percentile(recent_entropies, 25)
+                    self.entropy_high = np.percentile(recent_entropies, 75)
+                    print(f"  Episode {episode_idx + 1}: Updated thresholds using recent 5 episodes")
+                    print(f"    Recent entropies: {[f'{e:.4f}' for e in recent_entropies]}")
+                    print(f"    Updated: low={self.entropy_low:.4f}, high={self.entropy_high:.4f}")
         
-        # Clip to hard bounds only
-        lambda_new = np.clip(lambda_new, self.lambda_min, self.lambda_max)
+        if len(warmup_entropies) > 0:
+            entropy_mean = np.mean(warmup_entropies)
+            entropy_std = np.std(warmup_entropies)
+            
+            # Set initial entropy_high to max(warmup_mean + std, 0.15)
+            self.entropy_high = max(entropy_mean + entropy_std, 0.15)
+            self.entropy_low = max(0.05, entropy_mean - 3.0 * entropy_std)
+            self.delta_stable = max(0.05, entropy_std)
+            
+            print(f"Warm-up completed:")
+            print(f"  Entropy mean: {entropy_mean:.4f}")
+            print(f"  Entropy std: {entropy_std:.4f}")
+            print(f"  Final thresholds: low={self.entropy_low:.4f}, high={self.entropy_high:.4f}, stable={self.delta_stable:.4f}")
         
-        self.step_lambda_ema = lambda_new
-        return lambda_new
+        self.warmup_completed = True
 
     def _update_cache_episode(self, meta_features: List[float], H_t: float, y_t: int):
         """
@@ -545,7 +399,7 @@ class CCEAManager:
 
     def _compute_episode_quality_label(self, H_t: float, ΔH_t: float, V_t: float) -> int:
         """
-        Compute episode quality label y_t (internal helper for cache update)
+        Compute episode quality label y_t
         
         y_t = +1 if H_t ∈ [H_low, H_high] and |ΔH_t| < δ_stable and V_t > 0.8
         y_t = -1 if H_t < 0.5*H_low or H_t > 1.2*H_high or V_t < 0.5
@@ -639,8 +493,6 @@ class CCEAManager:
         entropy = self._compute_policy_entropy(obs_batch)
         return entropy.detach().cpu().item()
 
-
-
     def _outer_loop_update_episode(self, episode_entropy: float, episode_transitions: List[Dict]) -> Dict[str, Any]:
         """
         Outer loop (Slow Path): Episode-level cache update and lambda synchronization
@@ -685,8 +537,7 @@ class CCEAManager:
         self.lambda_t = self.step_lambda_ema
         
         # Episode-level lambda recalibration (compensation mechanism)
-        # Use episode-level U_cont to recalibrate lambda for better adaptation
-        episode_U_cont = self._compute_contrastive_uncertainty_fast(meta_features)
+        episode_U_cont = self._compute_contrastive_uncertainty(meta_features)
         self.lambda_t = (1.0 - 0.3) * self.lambda_t + 0.3 * (self.lambda_min + (self.lambda_max - self.lambda_min) * episode_U_cont)
         self.lambda_t = np.clip(self.lambda_t, self.lambda_min, self.lambda_max)
         self.step_lambda_ema = self.lambda_t  # Sync step_ema to prevent drift
@@ -698,7 +549,7 @@ class CCEAManager:
         self.novelty_history.append(V_t)
         
         # Compute contrastive uncertainty
-        U_cont = self._compute_contrastive_uncertainty_fast(meta_features)
+        U_cont = self._compute_contrastive_uncertainty(meta_features)
         self.contrastive_uncertainty_history.append(U_cont)
         
         return {
@@ -710,28 +561,6 @@ class CCEAManager:
             'lambda': self.lambda_t,
             'contrastive_uncertainty': U_cont
         }
-
-    def _inner_loop_update(self, obs_batch: torch.Tensor) -> torch.Tensor:
-        """
-        Inner loop: Policy update with entropy-regularized KL control
-        
-        L_π(θ) = -H(π_θ) + λ_t · D_KL(π_θ || π_θ0)
-        
-        where:
-        - H(π_θ) is the policy entropy (maximization)
-        - D_KL(π_θ || π_θ0) is the KL divergence from anchor policy (constraint)
-        - λ_t is the conservatism coefficient (evolved via outer loop)
-        
-        Returns:
-            loss: The computed loss tensor
-        """
-        entropy = self._compute_policy_entropy(obs_batch)
-        kl_div = self._compute_kl_divergence(obs_batch)
-        
-        lambda_tensor = torch.tensor(self.lambda_t, device=self.device)
-        loss = -entropy + lambda_tensor * kl_div
-        
-        return loss
 
     def _sample_batch(self, batch_size: Optional[int] = None) -> Optional[torch.Tensor]:
         """Sample a batch from experience buffer"""
@@ -756,18 +585,8 @@ class CCEAManager:
 
     def run_adaptation(self, num_episodes: int = 10) -> Tuple[List[Dict], Dict[str, Any]]:
         """
-        Run CCEA adaptation with Fast-Slow dual-scale architecture
-        
-        Fast Path (Step-level, every 10 steps):
-        - Aggregate step metrics
-        - Compute contrastive uncertainty (cold-start supported)
-        - Update lambda via EMA smoothing
-        - Inner loop policy update (every 30 steps)
-        
-        Slow Path (Episode-level, once per episode):
-        - Outer loop cache update (sparse writing)
-        - Synchronize lambda from step-level EMA
-        - Update history records
+        Run CCEA adaptation with Episode-level architecture only
+        (Step-level Fast Path has been removed for stability)
         
         Args:
             num_episodes: Number of adaptation episodes
@@ -790,8 +609,8 @@ class CCEAManager:
             self._warmup_thresholds()
         
         for episode in range(num_episodes):
-            # Step 1: Run episode with Fast-Slow dual-scale updates
-            episode_data = self._run_single_episode_with_updates()
+            # Step 1: Run episode
+            episode_data = self._run_single_episode()
             adaptation_data.append(episode_data)
             
             # Step 2: Compute episode entropy
@@ -850,12 +669,9 @@ class CCEAManager:
         
         return adaptation_data, summary
 
-    def _run_single_episode_with_updates(self) -> Dict[str, Any]:
+    def _run_single_episode(self) -> Dict[str, Any]:
         """
-        Run a single episode with episode-level updates only
-        
-        Step-level Fast Path has been removed to avoid dynamics conflict.
-        Lambda is now updated only at episode level via _outer_loop_update_episode.
+        Run a single episode and collect transitions
         
         Returns:
             episode_data: Dictionary containing episode information
@@ -869,10 +685,8 @@ class CCEAManager:
         episode_reward = 0
         episode_length = 0
         episode_transitions = []
-        self.current_episode_transitions = []
         
         done = False
-        step_count = 0
         
         while not done:
             with torch.no_grad():
@@ -887,7 +701,6 @@ class CCEAManager:
             
             episode_reward += reward
             episode_length += 1
-            step_count += 1
             
             # Store transition
             transition = {
@@ -899,39 +712,11 @@ class CCEAManager:
             }
             episode_transitions.append(transition)
             self.experience_buffer.append(transition)
-            self.current_episode_transitions.append(transition)
-            
-            # Compute step-level metrics
-            obs_batch = torch.FloatTensor(obs).unsqueeze(0).to(self.device)
-            entropy = self._compute_policy_entropy(obs_batch).detach().cpu().item()
-            smoothness = self._compute_policy_smoothness(obs_batch).detach().cpu().item()
-            
-            # Update step buffers
-            self.step_entropy_window.append(entropy)
-            self.step_buffer.append({
-                'entropy': entropy,
-                'smoothness': smoothness,
-                'obs': obs
-            })
-            
-            # Update novelty set
-            obs_key = tuple(np.round(obs, 2))
-            self.step_novelty_set.add(obs_key)
-            if len(self.step_novelty_set) > self.step_novelty_set_size:
-                self.step_novelty_set.pop()
-            
-            # Fast Path removed to avoid dynamics conflict between step-level and episode-level lambda updates
-            # Lambda is now updated only at episode level for stability
             
             obs = next_obs
             
             if episode_length >= 1000:
                 break
-        
-        # Clear step buffers at end of episode
-        self.step_buffer.clear()
-        self.step_entropy_window.clear()
-        self.step_novelty_set.clear()
         
         return {
             'episode_reward': episode_reward,
