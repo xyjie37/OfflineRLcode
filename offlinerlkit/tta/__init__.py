@@ -13,6 +13,7 @@ from offlinerlkit.tta.mcatta import CCEAManager, ContrastiveCache
 from offlinerlkit.tta.tarl import TARLManager
 from offlinerlkit.tta.stint import STINTManager
 from offlinerlkit.tta.tea import TEAManager
+from offlinerlkit.tta.come import COMEManager
 from offlinerlkit.tta.base_tta import BaseTTAAlgorithm
 from offlinerlkit.tta.universal_runner import run_tta_algorithm, compare_algorithms
 
@@ -28,6 +29,7 @@ __all__ = [
     "TARLManager",
     "STINTManager",
     "TEAManager",
+    "COMEManager",
     "BaseTTAAlgorithm",
     "run_tta_algorithm",
     "compare_algorithms"

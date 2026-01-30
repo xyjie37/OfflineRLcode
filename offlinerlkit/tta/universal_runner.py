@@ -162,6 +162,15 @@ def _get_default_config(algorithm_name: str) -> Dict[str, Any]:
             'v_min': 0.1,
             'learning_rate': 1e-4
         })
+    elif algorithm_name == 'come':
+        base_config.update({
+            'num_ensemble': 3,
+            'uncertainty_threshold': 0.1,
+            'kl_weight': 1.0,
+            'conservative_factor': 0.9,
+            'update_freq': 10,
+            'learning_rate': 1e-6
+        })
     
     return base_config
 
@@ -196,6 +205,9 @@ def _create_algorithm_manager(
     elif algorithm_name == 'ccea':
         from offlinerlkit.tta.mcatta import CCEAManager
         return CCEAManager(policy, env, config)
+    elif algorithm_name == 'come':
+        from offlinerlkit.tta.come import COMEManager
+        return COMEManager(policy, env, config)
     else:
         raise ValueError(f"Unknown algorithm: {algorithm_name}")
 
@@ -261,6 +273,15 @@ def _create_result_row(
             'contrastive_uncertainty_history_mean': summary.get('contrastive_uncertainty_history_mean', 0),
             'contrastive_uncertainty_history_std': summary.get('contrastive_uncertainty_history_std', 0)
         })
+    elif algorithm_name == 'come':
+        result_row.update({
+            'mean_uncertainty': summary.get('mean_uncertainty', 0),
+            'max_uncertainty': summary.get('max_uncertainty', 0),
+            'min_uncertainty': summary.get('min_uncertainty', 0),
+            'ensemble_size': summary.get('ensemble_size', 0),
+            'conservative_factor': summary.get('conservative_factor', 0),
+            'uncertainty_threshold': summary.get('uncertainty_threshold', 0)
+        })
     
     return result_row
 
@@ -290,6 +311,11 @@ def _print_seed_result(result_row: Dict[str, Any]):
               f"Final Entropy = {result_row['final_entropy']:.3f}, "
               f"Final ΔEntropy = {result_row['final_entropy_velocity']:.3f}, "
               f"Final U_cont = {result_row['final_contrastive_uncertainty']:.3f}")
+    elif algo == 'COME':
+        print(f"    Mean Uncertainty = {result_row['mean_uncertainty']:.4f}, "
+              f"Max Uncertainty = {result_row['max_uncertainty']:.4f}, "
+              f"Ensemble Size = {result_row['ensemble_size']}, "
+              f"Conservative Factor = {result_row['conservative_factor']:.2f}")
 
 
 def _save_results_to_csv(results: List[Dict], csv_path: str, algorithm_name: str):

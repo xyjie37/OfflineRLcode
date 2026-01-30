@@ -98,7 +98,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="通用TTA运行器示例")
     parser.add_argument("--mode", type=str, choices=['single', 'compare', 'custom'], 
                       default='single', help="运行模式")
-    parser.add_argument("--algorithm", type=str, choices=['stint', 'tarl', 'tea', 'ccea'], 
+    parser.add_argument("--algorithm", type=str, choices=['stint', 'tarl', 'tea', 'ccea', 'come'], 
                       default='tea', help="算法名称（single模式）")
     parser.add_argument("--env", type=str, default='hopper-medium-v2', help="环境名称")
     parser.add_argument("--checkpoint", type=str, default='./checkpoints/cql_hopper_medium.pt', 
