@@ -43,6 +43,8 @@ def get_args():
     parser.add_argument("--step-per-epoch", type=int, default=1000)
     parser.add_argument("--eval_episodes", type=int, default=10)
     parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument("--use-layernorm", type=bool, default=True,
+                        help="Whether to use LayerNorm in actor backbone (required for TARL TTA)")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
 
     return parser.parse_args()
@@ -79,7 +81,7 @@ def train(args=get_args()):
     env.seed(args.seed)
 
     # create policy model
-    actor_backbone = MLP(input_dim=np.prod(args.obs_shape), hidden_dims=[256, 256])
+    actor_backbone = MLP(input_dim=np.prod(args.obs_shape), hidden_dims=[256, 256], use_layernorm=args.use_layernorm)
     critic1_backbone = MLP(input_dim=np.prod(args.obs_shape)+args.action_dim, hidden_dims=[256, 256])
     critic2_backbone = MLP(input_dim=np.prod(args.obs_shape)+args.action_dim, hidden_dims=[256, 256])
     actor = Actor(actor_backbone, args.action_dim, max_action=args.max_action, device=args.device)
