@@ -8,3 +8,6 @@
 **/*.txt
 **/.vscode
 **/_log
+*.out
+checkpoints/
+nohup_*.out

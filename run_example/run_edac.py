@@ -50,6 +50,8 @@ def get_args():
     parser.add_argument("--deterministic-backup", type=bool, default=False)
     parser.add_argument("--eta", type=float, default=1.0)
     parser.add_argument("--normalize-reward", type=bool, default=False)
+    parser.add_argument("--use-layernorm", type=bool, default=True,
+                        help="Whether to use LayerNorm in actor backbone (required for TARL TTA)")
 
     parser.add_argument("--epoch", type=int, default=3000)
     parser.add_argument("--step-per-epoch", type=int, default=1000)
@@ -81,7 +83,7 @@ def train(args=get_args()):
     env.seed(args.seed)
 
     # create policy model
-    actor_backbone = MLP(input_dim=np.prod(args.obs_shape), hidden_dims=args.hidden_dims)
+    actor_backbone = MLP(input_dim=np.prod(args.obs_shape), hidden_dims=args.hidden_dims, use_layernorm=args.use_layernorm)
     dist = TanhDiagGaussian(
         latent_dim=getattr(actor_backbone, "output_dim"),
         output_dim=args.action_dim,

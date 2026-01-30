@@ -7,7 +7,8 @@ import d4rl
 import numpy as np
 import torch
 
-
+import sys
+sys.path.append('/home/jxyrl/OfflineRL-Kit')  # 绝对路径
 from offlinerlkit.nets import MLP
 from offlinerlkit.modules import Actor, Critic
 from offlinerlkit.utils.noise import GaussianNoise

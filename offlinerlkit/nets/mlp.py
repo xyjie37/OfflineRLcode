@@ -13,13 +13,17 @@ class MLP(nn.Module):
         hidden_dims: Union[List[int], Tuple[int]],
         output_dim: Optional[int] = None,
         activation: nn.Module = nn.ReLU,
-        dropout_rate: Optional[float] = None
+        dropout_rate: Optional[float] = None,
+        use_layernorm: bool = False
     ) -> None:
         super().__init__()
         hidden_dims = [input_dim] + list(hidden_dims)
         model = []
         for in_dim, out_dim in zip(hidden_dims[:-1], hidden_dims[1:]):
-            model += [nn.Linear(in_dim, out_dim), activation()]
+            model += [nn.Linear(in_dim, out_dim)]
+            if use_layernorm:
+                model += [nn.LayerNorm(out_dim)]
+            model += [activation()]
             if dropout_rate is not None:
                 model += [nn.Dropout(p=dropout_rate)]
 

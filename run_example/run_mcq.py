@@ -33,6 +33,8 @@ def get_args():
     parser.add_argument("--lmbda", type=float, default=0.9)
     parser.add_argument("--num-sampled-actions", type=int, default=10)
     parser.add_argument("--behavior-policy-lr", type=float, default=1e-3)
+    parser.add_argument("--use-layernorm", type=bool, default=True,
+                        help="Whether to use LayerNorm in actor backbone (required for TARL TTA)")
     parser.add_argument("--epoch", type=int, default=1000)
     parser.add_argument("--step-per-epoch", type=int, default=1000)
     parser.add_argument("--eval_episodes", type=int, default=10)

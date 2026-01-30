@@ -7,6 +7,10 @@ import d4rl
 import numpy as np
 import torch
 
+import sys
+sys.path.append('/home/jxyrl/OfflineRL-Kit')  # 绝对路径
+from offlinerlkit.nets import MLP
+
 
 from offlinerlkit.nets import MLP
 from offlinerlkit.modules import ActorProb, Critic, TanhDiagGaussian
@@ -75,7 +79,7 @@ def train(args=get_args()):
     env.seed(args.seed)
 
     # create policy model
-    actor_backbone = MLP(input_dim=np.prod(args.obs_shape), hidden_dims=args.hidden_dims)
+    actor_backbone = MLP(input_dim=np.prod(args.obs_shape), hidden_dims=args.hidden_dims, use_layernorm=True)
     critic1_backbone = MLP(input_dim=np.prod(args.obs_shape) + args.action_dim, hidden_dims=args.hidden_dims)
     critic2_backbone = MLP(input_dim=np.prod(args.obs_shape) + args.action_dim, hidden_dims=args.hidden_dims)
     dist = TanhDiagGaussian(

@@ -7,7 +7,8 @@ import d4rl
 import numpy as np
 import torch
 
-
+import sys
+sys.path.append('/home/jxyrl/OfflineRL-Kit')  # 绝对路径
 from offlinerlkit.nets import MLP
 from offlinerlkit.modules import ActorProb, Critic, DiagGaussian
 from offlinerlkit.buffer import ReplayBuffer
@@ -36,6 +37,8 @@ def get_args():
     parser.add_argument("--tau", type=float, default=0.005)
     parser.add_argument("--expectile", type=float, default=0.7)
     parser.add_argument("--temperature", type=float, default=3.0)
+    parser.add_argument("--use-layernorm", type=bool, default=True,
+                        help="Whether to use LayerNorm in actor backbone (required for TARL TTA)")
     parser.add_argument("--epoch", type=int, default=1000)
     parser.add_argument("--step-per-epoch", type=int, default=1000)
     parser.add_argument("--eval_episodes", type=int, default=10)
