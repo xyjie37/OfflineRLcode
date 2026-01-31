@@ -171,6 +171,13 @@ def _get_default_config(algorithm_name: str) -> Dict[str, Any]:
             'update_freq': 10,
             'learning_rate': 1e-6
         })
+    elif algorithm_name == 'tent':
+        base_config.update({
+            'learning_rate': 1e-3,
+            'momentum': 0.9,
+            'damping': 0.0,
+            'cache_capacity': 100
+        })
     
     return base_config
 
@@ -208,6 +215,9 @@ def _create_algorithm_manager(
     elif algorithm_name == 'come':
         from offlinerlkit.tta.come import COMEManager
         return COMEManager(policy, env, config)
+    elif algorithm_name == 'tent':
+        from offlinerlkit.tta.tent import TentManager
+        return TentManager(policy, env, config)
     else:
         raise ValueError(f"Unknown algorithm: {algorithm_name}")
 
@@ -278,9 +288,13 @@ def _create_result_row(
             'mean_uncertainty': summary.get('mean_uncertainty', 0),
             'max_uncertainty': summary.get('max_uncertainty', 0),
             'min_uncertainty': summary.get('min_uncertainty', 0),
-            'ensemble_size': summary.get('ensemble_size', 0),
-            'conservative_factor': summary.get('conservative_factor', 0),
-            'uncertainty_threshold': summary.get('uncertainty_threshold', 0)
+            'ensemble_disagreement': summary.get('ensemble_disagreement', 0)
+        })
+    elif algorithm_name == 'tent':
+        result_row.update({
+            'mean_entropy': summary.get('mean_entropy', 0),
+            'entropy_history_mean': np.mean(summary.get('entropy_history', [])) if summary.get('entropy_history') else 0,
+            'entropy_history_std': np.std(summary.get('entropy_history', [])) if summary.get('entropy_history') else 0
         })
     
     return result_row

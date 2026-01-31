@@ -122,7 +122,7 @@ class TTAManager:
         self.adaptation_step = 0
         self.best_performance = -float('inf')
         
-        # 初始化外部算法管理器（如 TEA, CCEA, TARL, STINT, COME）
+        # 初始化外部算法管理器（如 TEA, CCEA, TARL, STINT, COME, Tent）
         self.external_manager = None
         if self.adaptation_strategy == 'tea':
             from offlinerlkit.tta.tea import TEAManager
@@ -132,6 +132,10 @@ class TTAManager:
             from offlinerlkit.tta.come import COMEManager
             self.external_manager = COMEManager(self.policy, self.env, self.adaptation_config)
             print(f"Initialized COME (Conservative Model Ensemble) manager")
+        elif self.adaptation_strategy == 'tent':
+            from offlinerlkit.tta.tent import TentManager
+            self.external_manager = TentManager(self.policy, self.env, self.adaptation_config)
+            print(f"Initialized Tent (Test-Time Adaptation) manager")
     
     def _get_policy_device(self) -> torch.device:
         """获取策略的设备"""
